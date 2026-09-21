@@ -284,17 +284,10 @@ import matplotlib.pyplot as plt
 import os
 import json
 import time
-from collections import Counter
 
 # ─────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────
-BANDS = [
-    (0,  10,  0.05, 0),
-    (10, 30,  0.15, 1),
-    (30, 100, 0.50, 2),
-]
-
 SIZE_MAP = np.array([0.05, 0.15, 0.50], dtype=np.float32)
 
 FILES = [
@@ -302,96 +295,101 @@ FILES = [
     for i in range(10)
 ]
 
-SAVE_DIR = "/kaggle/working/voxel_store"
+SAVE_DIR = "/content/voxel_store"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
+
 # ─────────────────────────────────────────
-# PIPELINE
+# LOAD
 # ─────────────────────────────────────────
 def load_points(path):
     return np.fromfile(path, dtype=np.float32).reshape(-1, 4)
 
 
+# ─────────────────────────────────────────
+# PIPELINE
+# ─────────────────────────────────────────
 class VoxelPipeline:
-    def __init__(self, max_points=150000, max_voxels=100000):
-        self.max_points = max_points
-        self.max_voxels = max_voxels
-        self.levels   = np.zeros(max_points, dtype=np.int32)
-        self.vox_size = np.zeros(max_points, dtype=np.float32)
-        self.dist     = np.zeros(max_points, dtype=np.float32)
-        self.count    = np.zeros(max_voxels, dtype=np.int32)
-        self.z_sum    = np.zeros(max_voxels, dtype=np.float64)
-        self.z_sum2   = np.zeros(max_voxels, dtype=np.float64)
-        self.z_min    = np.zeros(max_voxels, dtype=np.float64)
-        self.z_max    = np.zeros(max_voxels, dtype=np.float64)
-        self.i_sum    = np.zeros(max_voxels, dtype=np.float64)
+    """
+    Optimized adaptive voxelization pipeline.
+
+    Key changes vs original:
+      1. Level assignment: fully vectorized, no Python loops.
+      2. Key hashing: unchanged (already fast).
+      3. Feature aggregation: replaced 6x np.add.at / np.minimum.at /
+         np.maximum.at with a single argsort + np.*.reduceat per feature.
+         This eliminates unbuffered scatter ops over ~100k points.
+      4. No pre-allocated buffers (they required zero-fill slicing which
+         added overhead; NumPy allocation of ~100k floats is negligible).
+    """
 
     def process(self, points):
         N = len(points)
+        x = points[:, 0]
+        y = points[:, 1]
+        z = points[:, 2]
+        inten = points[:, 3]
 
-        # ── assign levels ──────────────────────────────
-        dist     = self.dist[:N]
-        levels   = self.levels[:N]
-        vox_size = self.vox_size[:N]
+        # ── 1. assign levels (fully vectorized) ──────────────
+        dist = np.sqrt(x * x + y * y)
 
-        np.sqrt(points[:,0]**2 + points[:,1]**2, out=dist)
+        levels   = np.where(dist < 10, np.int32(0),
+                   np.where(dist < 30, np.int32(1),
+                                       np.int32(2)))
+        vox_size = SIZE_MAP[levels]          # (N,) float32
 
-        levels[:]   = 2;  vox_size[:] = 0.50
-        m1 = dist < 30;   levels[m1]  = 1; vox_size[m1] = 0.15
-        m0 = dist < 10;   levels[m0]  = 0; vox_size[m0] = 0.05
-
-        # ── hash grid ──────────────────────────────────
+        # ── 2. voxel coordinates ─────────────────────────────
         coords = np.floor(
-            points[:,:3] / vox_size[:,None]
-        ).astype(np.int32)
+            points[:, :3] / vox_size[:, None]
+        ).astype(np.int32)                   # (N, 3)
 
-        keys   = np.stack([levels,
-                           coords[:,0],
-                           coords[:,1],
-                           coords[:,2]], axis=1).astype(np.int32)
-        keys_c = np.ascontiguousarray(keys)
+        # ── 3. unique voxel keys ─────────────────────────────
+        # Pack [level, ix, iy, iz] into a void dtype for np.unique
+        keys_c = np.ascontiguousarray(
+            np.stack([levels, coords[:, 0],
+                      coords[:, 1], coords[:, 2]], axis=1)
+        )                                    # (N, 4) int32
         keys_v = keys_c.view(
             np.dtype((np.void, keys_c.dtype.itemsize * 4))
         ).ravel()
 
         unique_void, inverse = np.unique(keys_v, return_inverse=True)
         unique_keys = unique_void.view(np.int32).reshape(-1, 4)
+        V = len(unique_keys)
 
-        sort_order     = np.argsort(inverse, kind='stable')
-        sorted_inverse = inverse[sort_order]
-        split_points   = np.searchsorted(
-            sorted_inverse, np.arange(len(unique_keys))
-        )
+        # ── 4. sort points by voxel index (one sort, reused) ─
+        order          = np.argsort(inverse, kind='stable')
+        inv_sorted     = inverse[order]
 
-        # ── features ───────────────────────────────────
-        V     = len(unique_keys)
-        z     = points[:,2].astype(np.float64)
-        inten = points[:,3].astype(np.float64)
+        # Group start positions (one per unique voxel)
+        diff    = np.diff(inv_sorted)
+        splits  = np.flatnonzero(diff) + 1
+        starts  = np.r_[0, splits]          # length V
 
-        count  = self.count[:V];  count[:]  = 0
-        z_sum  = self.z_sum[:V];  z_sum[:]  = 0
-        z_sum2 = self.z_sum2[:V]; z_sum2[:] = 0
-        z_min  = self.z_min[:V];  z_min[:]  =  np.inf
-        z_max  = self.z_max[:V];  z_max[:]  = -np.inf
-        i_sum  = self.i_sum[:V];  i_sum[:]  = 0
+        # ── 5. per-voxel feature aggregation (reduceat) ──────
+        z_sorted     = z[order].astype(np.float64)
+        inten_sorted = inten[order].astype(np.float64)
+        ones         = np.ones(N, dtype=np.float64)
 
-        np.add.at(count,  inverse, 1)
-        np.add.at(z_sum,  inverse, z)
-        np.add.at(z_sum2, inverse, z**2)
-        np.minimum.at(z_min, inverse, z)
-        np.maximum.at(z_max, inverse, z)
-        np.add.at(i_sum,  inverse, inten)
+        count  = np.add.reduceat(ones,         starts).astype(np.int32)
+        z_sum  = np.add.reduceat(z_sorted,     starts)
+        z_sum2 = np.add.reduceat(z_sorted**2,  starts)
+        z_min  = np.minimum.reduceat(z_sorted, starts)
+        z_max  = np.maximum.reduceat(z_sorted, starts)
+        i_sum  = np.add.reduceat(inten_sorted, starts)
 
+        # Derived statistics
         z_mean  = z_sum  / count
-        z_var   = z_sum2 / count - z_mean**2
+        z_var   = np.maximum(z_sum2 / count - z_mean**2, 0.0)  # clamp fp noise
         z_range = z_max  - z_min
         i_mean  = i_sum  / count
 
-        lv = unique_keys[:,0]
+        # ── 6. voxel centres ─────────────────────────────────
+        lv = unique_keys[:, 0]
         vs = SIZE_MAP[lv]
-        cx = (unique_keys[:,1] + 0.5) * vs
-        cy = (unique_keys[:,2] + 0.5) * vs
-        cz = (unique_keys[:,3] + 0.5) * vs
+        cx = (unique_keys[:, 1] + 0.5) * vs
+        cy = (unique_keys[:, 2] + 0.5) * vs
+        cz = (unique_keys[:, 3] + 0.5) * vs
 
         return {
             "unique_keys":    unique_keys,
@@ -400,13 +398,13 @@ class VoxelPipeline:
             "center_x":       cx,
             "center_y":       cy,
             "center_z":       cz,
-            "point_count":    count.copy(),
-            "height_mean":    z_mean.copy(),
-            "height_min":     z_min.copy(),
-            "height_max":     z_max.copy(),
-            "height_var":     z_var.copy(),
-            "height_range":   z_range.copy(),
-            "intensity_mean": i_mean.copy(),
+            "point_count":    count,
+            "height_mean":    z_mean,
+            "height_min":     z_min,
+            "height_max":     z_max,
+            "height_var":     z_var,
+            "height_range":   z_range,
+            "intensity_mean": i_mean,
         }
 
 
@@ -414,30 +412,12 @@ class VoxelPipeline:
 # STORAGE
 # ─────────────────────────────────────────
 def save_voxels(features, frame_name, save_dir):
-    """
-    Save all voxel arrays as a single compressed .npz file.
-    One file per frame. Loads back instantly with np.load.
-
-    Stored arrays:
-      keys        — (V,4) int32  [level, ix, iy, iz]
-      levels      — (V,)  int32
-      vox_size    — (V,)  float32
-      center_xyz  — (V,3) float32  [cx, cy, cz]
-      point_count — (V,)  int32
-      height_mean — (V,)  float32
-      height_min  — (V,)  float32
-      height_max  — (V,)  float32
-      height_var  — (V,)  float32
-      height_range— (V,)  float32
-      intensity   — (V,)  float32
-    """
-    frame_id = os.path.splitext(frame_name)[0]
-    out_path = os.path.join(save_dir, f"{frame_id}_voxels.npz")
-
+    frame_id   = os.path.splitext(frame_name)[0]
+    out_path   = os.path.join(save_dir, f"{frame_id}_voxels.npz")
     center_xyz = np.stack([
         features["center_x"],
         features["center_y"],
-        features["center_z"]
+        features["center_z"],
     ], axis=1).astype(np.float32)
 
     np.savez_compressed(
@@ -458,19 +438,15 @@ def save_voxels(features, frame_name, save_dir):
 
 
 def load_voxels(frame_id, save_dir):
-    """
-    Load a saved voxel frame back into a features dict.
-    Usage: features = load_voxels("000000", SAVE_DIR)
-    """
     path = os.path.join(save_dir, f"{frame_id}_voxels.npz")
     d    = np.load(path)
     return {
         "unique_keys":    d["keys"],
         "levels":         d["levels"],
         "vox_size":       d["vox_size"],
-        "center_x":       d["center_xyz"][:,0],
-        "center_y":       d["center_xyz"][:,1],
-        "center_z":       d["center_xyz"][:,2],
+        "center_x":       d["center_xyz"][:, 0],
+        "center_y":       d["center_xyz"][:, 1],
+        "center_z":       d["center_xyz"][:, 2],
         "point_count":    d["point_count"],
         "height_mean":    d["height_mean"],
         "height_min":     d["height_min"],
@@ -482,10 +458,6 @@ def load_voxels(frame_id, save_dir):
 
 
 def save_metadata(results, save_dir):
-    """
-    Save per-frame summary stats as JSON.
-    Useful for the benchmark table later.
-    """
     meta_path = os.path.join(save_dir, "metadata.json")
     with open(meta_path, "w") as f:
         json.dump(results, f, indent=2)
@@ -505,13 +477,11 @@ def voxel_quality_report(features, points):
     print("VOXEL QUALITY REPORT")
     print("=" * 60)
 
-    # ── overall ────────────────────────────────────────
     print(f"\n── Overall ──")
     print(f"  Total voxels      : {len(pcount):,}")
     print(f"  Total points      : {len(points):,}")
     print(f"  Compression ratio : {len(points)/len(pcount):.2f} pts/voxel")
 
-    # ── points per voxel ───────────────────────────────
     print(f"\n── Points per voxel ──")
     print(f"  Min    : {pcount.min()}")
     print(f"  Max    : {pcount.max()}")
@@ -522,7 +492,6 @@ def voxel_quality_report(features, points):
     print(f"  >10pt voxels : {(pcount>10).sum():,} "
           f"({(pcount>10).mean()*100:.1f}%)")
 
-    # ── height range ───────────────────────────────────
     print(f"\n── Height range per voxel ──")
     print(f"  Min  : {hrange.min():.4f} m")
     print(f"  Max  : {hrange.max():.4f} m")
@@ -530,7 +499,18 @@ def voxel_quality_report(features, points):
     print(f"  Suspicious (>2m) : {(hrange>2).sum():,}")
     print(f"  Flat (=0m)       : {(hrange==0).sum():,}")
 
-    # ── per level ──────────────────────────────────────
+    # Stronger correctness check
+    hmin = features["height_min"]
+    hmax = features["height_max"]
+    bad_order  = (hmin > hmax + 1e-4).sum()
+    range_err  = np.abs(hrange - (hmax - hmin))
+    bad_range  = (range_err > 1e-4).sum()
+    print(f"\n── Correctness checks ──")
+    print(f"  ✓ height_min > height_max        : {bad_order} "
+          f"{'✓' if bad_order == 0 else '✗ WARNING'}")
+    print(f"  ✓ height_range ≠ hmax-hmin (>1e-4): {bad_range} "
+          f"{'✓' if bad_range == 0 else '✗ WARNING'}")
+
     print(f"\n── Per-level breakdown ──")
     size_labels = {0: "5cm", 1: "15cm", 2: "50cm"}
     for lv in [0, 1, 2]:
@@ -540,18 +520,13 @@ def voxel_quality_report(features, points):
         pc = pcount[mask]
         hr = hrange[mask]
         print(f"\n  L{lv} ({size_labels[lv]}) — {mask.sum():,} voxels")
-        print(f"    pts/voxel : "
-              f"min={pc.min()} "
-              f"mean={pc.mean():.2f} "
-              f"max={pc.max()}")
+        print(f"    pts/voxel    : "
+              f"min={pc.min()} mean={pc.mean():.2f} max={pc.max()}")
         print(f"    height_range : "
-              f"min={hr.min():.3f} "
-              f"mean={hr.mean():.3f} "
-              f"max={hr.max():.3f}")
-        print(f"    single-pt : {(pc==1).sum():,} "
+              f"min={hr.min():.3f} mean={hr.mean():.3f} max={hr.max():.3f}")
+        print(f"    single-pt    : {(pc==1).sum():,} "
               f"({(pc==1).mean()*100:.1f}%)")
 
-    # ── spatial coverage ───────────────────────────────
     print(f"\n── Spatial coverage ──")
     print(f"  X : {features['center_x'].min():.1f} "
           f"to {features['center_x'].max():.1f} m")
@@ -581,16 +556,15 @@ def check_zone_boundaries(features):
         print(f"    L{lv_a} voxels : {la}")
         print(f"    L{lv_b} voxels : {lb}")
 
-    # Use tolerance of half a 50cm voxel = 0.25m
     TOLERANCE = 0.25
     l0_far  = ((lv == 0) & (dist > 10 + TOLERANCE)).sum()
     l2_near = ((lv == 2) & (dist < 30 - TOLERANCE)).sum()
-
     print(f"\n  L0 voxels beyond {10+TOLERANCE}m : {l0_far} "
           f"{'✓' if l0_far==0 else '✗ WARNING'}")
     print(f"  L2 voxels within {30-TOLERANCE}m : {l2_near} "
           f"{'✓' if l2_near==0 else '✗ WARNING'}")
     print(f"  (tolerance = {TOLERANCE}m = half one L2 voxel width)")
+
 
 # ─────────────────────────────────────────
 # QUALITY PLOTS
@@ -604,14 +578,11 @@ def voxel_quality_plots(features, frame_name, save_dir):
     cy     = features["center_y"]
 
     colors = ['steelblue', 'darkorange', 'green']
-    labels = ['L0 5cm (0–10m)',
-              'L1 15cm (10–30m)',
-              'L2 50cm (30–100m)']
+    labels = ['L0 5cm (0–10m)', 'L1 15cm (10–30m)', 'L2 50cm (30–100m)']
 
     fig, axes = plt.subplots(2, 3, figsize=(16, 9))
     fig.suptitle(f"Voxel Quality — {frame_name}", fontsize=14)
 
-    # ── 1: points per voxel ────────────────────────────
     ax = axes[0, 0]
     for lv in [0, 1, 2]:
         mask = levels == lv
@@ -623,7 +594,6 @@ def voxel_quality_plots(features, frame_name, save_dir):
     ax.legend(fontsize=8)
     ax.set_yscale('log')
 
-    # ── 2: height range ────────────────────────────────
     ax = axes[0, 1]
     for lv in [0, 1, 2]:
         mask = levels == lv
@@ -633,49 +603,39 @@ def voxel_quality_plots(features, frame_name, save_dir):
     ax.set_title("Height Range Distribution")
     ax.legend(fontsize=8)
 
-    # ── 3: height std dev ──────────────────────────────
     ax = axes[0, 2]
     for lv in [0, 1, 2]:
         mask = levels == lv
-        ax.hist(np.sqrt(hvar[mask] + 1e-9),
-                bins=50, alpha=0.6,
+        ax.hist(np.sqrt(hvar[mask] + 1e-9), bins=50, alpha=0.6,
                 color=colors[lv], label=labels[lv])
     ax.set_xlabel("Height std dev (m)")
     ax.set_title("Height Variance Distribution")
     ax.legend(fontsize=8)
 
-    # ── 4: top-down by level ───────────────────────────
     ax = axes[1, 0]
     for lv in [0, 1, 2]:
         mask = levels == lv
-        ax.scatter(cx[mask], cy[mask],
-                   s=0.3, alpha=0.4,
+        ax.scatter(cx[mask], cy[mask], s=0.3, alpha=0.4,
                    color=colors[lv], label=labels[lv])
-    # Draw boundary rings
-    for r, c in [(10,'red'), (30,'purple')]:
-        circle = plt.Circle((0,0), r, color=c,
-                             fill=False, linewidth=1,
-                             linestyle='--', alpha=0.7)
+    for r, c in [(10, 'red'), (30, 'purple')]:
+        circle = plt.Circle((0, 0), r, color=c, fill=False,
+                             linewidth=1, linestyle='--', alpha=0.7)
         ax.add_patch(circle)
     ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)")
     ax.set_title("Top-down: Resolution Zones")
     ax.legend(fontsize=7, markerscale=5)
     ax.set_aspect('equal')
 
-    # ── 5: point density ───────────────────────────────
     ax = axes[1, 1]
-    sc = ax.scatter(cx, cy,
-                    c=np.log1p(pcount),
+    sc = ax.scatter(cx, cy, c=np.log1p(pcount),
                     s=0.3, alpha=0.5, cmap='plasma')
     plt.colorbar(sc, ax=ax, label='log(point count)')
     ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)")
     ax.set_title("Top-down: Point Density")
     ax.set_aspect('equal')
 
-    # ── 6: mean height ─────────────────────────────────
     ax = axes[1, 2]
-    sc = ax.scatter(cx, cy,
-                    c=features["height_mean"],
+    sc = ax.scatter(cx, cy, c=features["height_mean"],
                     s=0.3, alpha=0.5, cmap='RdYlGn')
     plt.colorbar(sc, ax=ax, label='mean height (m)')
     ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)")
@@ -696,9 +656,6 @@ def voxel_quality_plots(features, frame_name, save_dir):
 # STORAGE VERIFICATION
 # ─────────────────────────────────────────
 def verify_storage(frame_id, save_dir, original_features):
-    """
-    Load saved voxels back and confirm they match original.
-    """
     print(f"\n── Storage verification: {frame_id} ──")
     loaded = load_voxels(frame_id, save_dir)
 
@@ -728,7 +685,6 @@ def verify_storage(frame_id, save_dir, original_features):
         if not result:
             all_ok = False
 
-    # File size
     npz_path = os.path.join(save_dir, f"{frame_id}_voxels.npz")
     size_kb  = os.path.getsize(npz_path) / 1024
     print(f"  File size : {size_kb:.1f} KB")
@@ -738,82 +694,1679 @@ def verify_storage(frame_id, save_dir, original_features):
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
-pipeline = VoxelPipeline(max_points=150000, max_voxels=100000)
-_ = pipeline.process(load_points(FILES[0]))  # warmup
+pipeline = VoxelPipeline()
+_ = pipeline.process(load_points(FILES[0]))   # warmup
 
 all_meta = []
 
 for fpath in FILES:
-    fname  = os.path.basename(fpath)
-    fid    = os.path.splitext(fname)[0]
+    fname = os.path.basename(fpath)
+    fid   = os.path.splitext(fname)[0]
 
     print(f"\n{'='*60}")
     print(f"Processing {fname}")
     print(f"{'='*60}")
 
-    # ── run pipeline ───────────────────────────────────
     points   = load_points(fpath)
     t0       = time.perf_counter()
     features = pipeline.process(points)
     elapsed  = (time.perf_counter() - t0) * 1000
 
-    # ── save voxels ────────────────────────────────────
     out_path = save_voxels(features, fname, SAVE_DIR)
     print(f"Saved voxels → {out_path}")
 
-    # ── quality report ─────────────────────────────────
     voxel_quality_report(features, points)
     check_zone_boundaries(features)
 
-    # ── plots (first frame only to avoid too many images)
     if fid == "000000":
         voxel_quality_plots(features, fname, SAVE_DIR)
 
-    # ── verify storage ─────────────────────────────────
     verify_storage(fid, SAVE_DIR, features)
 
-    # ── collect metadata ───────────────────────────────
     pcount = features["point_count"]
     all_meta.append({
-        "frame":         fid,
-        "n_points":      int(len(points)),
-        "n_voxels":      int(len(features["unique_keys"])),
-        "n_l0":          int((features["levels"]==0).sum()),
-        "n_l1":          int((features["levels"]==1).sum()),
-        "n_l2":          int((features["levels"]==2).sum()),
-        "pts_per_voxel": float(pcount.mean()),
+        "frame":             fid,
+        "n_points":          int(len(points)),
+        "n_voxels":          int(len(features["unique_keys"])),
+        "n_l0":              int((features["levels"] == 0).sum()),
+        "n_l1":              int((features["levels"] == 1).sum()),
+        "n_l2":              int((features["levels"] == 2).sum()),
+        "pts_per_voxel":     float(pcount.mean()),
         "height_range_mean": float(features["height_range"].mean()),
-        "pipeline_ms":   float(elapsed),
-        "fps":           float(1000/elapsed),
-        "npz_size_kb":   float(
+        "pipeline_ms":       float(elapsed),
+        "fps":               float(1000 / elapsed),
+        "npz_size_kb":       float(
             os.path.getsize(
                 os.path.join(SAVE_DIR, f"{fid}_voxels.npz")
             ) / 1024
         ),
     })
 
-# ── save metadata ──────────────────────────────────────
 meta_path = save_metadata(all_meta, SAVE_DIR)
 print(f"\nMetadata saved → {meta_path}")
 
-# ── final storage summary ──────────────────────────────
-print("\n" + "="*70)
+print("\n" + "=" * 70)
 print("STORAGE SUMMARY")
-print("="*70)
+print("=" * 70)
 print(f"{'Frame':<12} {'Voxels':>8} {'pts/vox':>8} "
-      f"{'FPS':>6} {'File KB':>8}")
-print("-"*70)
+      f"{'ms':>8} {'FPS':>6} {'File KB':>8}")
+print("-" * 70)
 for m in all_meta:
     print(f"{m['frame']:<12} {m['n_voxels']:>8,} "
           f"{m['pts_per_voxel']:>8.2f} "
+          f"{m['pipeline_ms']:>8.1f} "
           f"{m['fps']:>6.1f} "
           f"{m['npz_size_kb']:>8.1f}")
 
+avg_ms = np.mean([m['pipeline_ms'] for m in all_meta])
 total_kb = sum(m['npz_size_kb'] for m in all_meta)
-print(f"\n  Total storage (10 frames) : {total_kb:.1f} KB "
-      f"= {total_kb/1024:.2f} MB")
+print(f"\n  Avg voxelization time     : {avg_ms:.1f} ms  ({1000/avg_ms:.1f} FPS)")
+print(f"  Total storage (10 frames) : {total_kb:.1f} KB = {total_kb/1024:.2f} MB")
 print(f"  Avg per frame             : {total_kb/len(all_meta):.1f} KB")
+print(f"\n  Projection (from prev run): ~30.2 ms")
+print(f"  Combined estimate         : {1000/(avg_ms + 30.2):.1f} FPS")
 print(f"\nFiles saved to: {SAVE_DIR}")
 print("\nTo reload any frame later:")
 print('  features = load_voxels("000000", SAVE_DIR)')
 
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import os
+import time
+
+# ─────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────
+SAVE_DIR    = "/content/voxel_store"
+MAP_DIR     = "/content/maps_2d"
+os.makedirs(MAP_DIR, exist_ok=True)
+
+SIZE_MAP    = np.array([0.05, 0.15, 0.50], dtype=np.float32)
+LEVEL_NAMES = {0: "L0_5cm", 1: "L1_15cm", 2: "L2_50cm"}
+
+# Feature channel indices inside the grid array
+CH = {
+    "height_max":   0,
+    "height_min":   1,
+    "height_range": 2,
+    "height_mean":  3,
+    "point_count":  4,
+    "voxel_count":  5,
+    "intensity":    6,
+    "is_occupied":  7,
+    "pts_per_m2":   8,
+}
+N_CHANNELS = len(CH)
+
+FILES = [
+    f"/content/sematic_kitti_sample/{i:06d}.bin"
+    for i in range(10)
+]
+
+
+# ─────────────────────────────────────────
+# LOAD SAVED VOXELS
+# ─────────────────────────────────────────
+def load_voxels(frame_id, save_dir):
+    path = os.path.join(save_dir, f"{frame_id}_voxels.npz")
+    d    = np.load(path)
+    return {
+        "unique_keys":    d["keys"],
+        "levels":         d["levels"],
+        "vox_size":       d["vox_size"],
+        "center_x":       d["center_xyz"][:, 0],
+        "center_y":       d["center_xyz"][:, 1],
+        "center_z":       d["center_xyz"][:, 2],
+        "point_count":    d["point_count"],
+        "height_mean":    d["height_mean"],
+        "height_min":     d["height_min"],
+        "height_max":     d["height_max"],
+        "height_var":     d["height_var"],
+        "height_range":   d["height_range"],
+        "intensity_mean": d["intensity"],
+    }
+
+
+# ─────────────────────────────────────────
+# PRECOMPUTE — masks, grid bounds, flat indices
+# Done once per frame across all levels.
+# ─────────────────────────────────────────
+def precompute_level_data(features):
+    """
+    Returns a dict keyed by level (0,1,2).
+    Each value contains everything project_level needs,
+    computed in a single pass over the features arrays.
+    """
+    levels_arr = features["levels"]
+    cx_all     = features["center_x"]
+    cy_all     = features["center_y"]
+
+    level_data = {}
+    for lv in [0, 1, 2]:
+        mask = levels_arr == lv
+        if mask.sum() == 0:
+            level_data[lv] = None
+            continue
+
+        vs = SIZE_MAP[lv]
+        cx = cx_all[mask]
+        cy = cy_all[mask]
+
+        ix = np.floor(cx / vs).astype(np.int32)
+        iy = np.floor(cy / vs).astype(np.int32)
+
+        ix_min = ix.min()
+        iy_min = iy.min()
+        ix_rel = ix - ix_min
+        iy_rel = iy - iy_min
+
+        H = int(ix_rel.max()) + 1
+        W = int(iy_rel.max()) + 1
+
+        flat = (ix_rel * W + iy_rel).astype(np.int64)
+
+        level_data[lv] = {
+            "mask":   mask,
+            "H":      H,
+            "W":      W,
+            "flat":   flat,
+            "vs":     float(vs),
+            "ix_min": int(ix_min),
+            "iy_min": int(iy_min),
+        }
+
+    return level_data
+
+
+# ─────────────────────────────────────────
+# CORE PROJECTION — reduceat-based, no Python scatter loops
+# ─────────────────────────────────────────
+def project_level(features, lv_data, level):
+    """
+    Project all voxels of one level into a 2D grid.
+    Returns (grid, meta) where grid has shape (H, W, N_CHANNELS).
+
+    Aggregation per cell:
+      height_max   → max of voxel height_max
+      height_min   → min of voxel height_min
+      height_range → cell height_max - cell height_min  (recomputed)
+      height_mean  → point-weighted mean
+      point_count  → sum
+      voxel_count  → count of contributing voxels
+      intensity    → point-weighted mean
+      is_occupied  → 1 if any voxel contributes
+      pts_per_m2   → point_count / cell_area
+    """
+    if lv_data is None:
+        return None, None
+
+    H        = lv_data["H"]
+    W        = lv_data["W"]
+    flat     = lv_data["flat"]
+    vs       = lv_data["vs"]
+    ix_min   = lv_data["ix_min"]
+    iy_min   = lv_data["iy_min"]
+    mask     = lv_data["mask"]
+    C        = H * W
+    cell_area = vs * vs
+
+    # ── extract masked source arrays ─────────────────────
+    h_max   = features["height_max"][mask].astype(np.float32)
+    h_min   = features["height_min"][mask].astype(np.float32)
+    h_mean  = features["height_mean"][mask].astype(np.float32)
+    pcount  = features["point_count"][mask].astype(np.float32)
+    inten   = features["intensity_mean"][mask].astype(np.float32)
+
+    # ── sort once by flat cell index ──────────────────────
+    order    = np.argsort(flat, kind="stable")
+    flat_s   = flat[order]
+    h_max_s  = h_max[order]
+    h_min_s  = h_min[order]
+    h_mean_s = h_mean[order]
+    pcount_s = pcount[order]
+    inten_s  = inten[order]
+
+    # Group boundaries: where the cell index changes
+    diff     = np.diff(flat_s)
+    splits   = np.flatnonzero(diff) + 1          # positions of group starts (excl. 0)
+    starts   = np.r_[0, splits]                  # include group 0
+
+    unique_cells = flat_s[starts]                # which cells are occupied
+
+    # ── reduceat aggregations (all O(N), no Python loops) ─
+    g_hmax_occ  = np.maximum.reduceat(h_max_s,  starts)
+    g_hmin_occ  = np.minimum.reduceat(h_min_s,  starts)
+    g_pcount_occ = np.add.reduceat(pcount_s,    starts)
+    g_vcount_occ = np.add.reduceat(
+                       np.ones(len(flat_s), dtype=np.float32), starts)
+    g_hmean_num  = np.add.reduceat(h_mean_s * pcount_s, starts)
+    g_inten_num  = np.add.reduceat(inten_s  * pcount_s, starts)
+
+    # Point-weighted means
+    g_hmean_occ = g_hmean_num / g_pcount_occ
+    g_inten_occ = g_inten_num / g_pcount_occ
+
+    # Height range recomputed from aggregated min/max
+    g_hrange_occ = g_hmax_occ - g_hmin_occ
+
+    # pts/m²
+    g_pts_m2_occ = g_pcount_occ / cell_area
+
+    # ── scatter occupied results into full C-length arrays ─
+    # (only occupied cells get written; empty cells stay 0)
+    g_hmax   = np.zeros(C, dtype=np.float32)
+    g_hmin   = np.zeros(C, dtype=np.float32)
+    g_hrange = np.zeros(C, dtype=np.float32)
+    g_hmean  = np.zeros(C, dtype=np.float32)
+    g_pcount = np.zeros(C, dtype=np.float32)
+    g_vcount = np.zeros(C, dtype=np.float32)
+    g_inten  = np.zeros(C, dtype=np.float32)
+    g_occ    = np.zeros(C, dtype=np.float32)
+    g_pts_m2 = np.zeros(C, dtype=np.float32)
+
+    uc = unique_cells  # occupied flat indices (no repeats)
+    g_hmax[uc]   = g_hmax_occ
+    g_hmin[uc]   = g_hmin_occ
+    g_hrange[uc] = g_hrange_occ
+    g_hmean[uc]  = g_hmean_occ
+    g_pcount[uc] = g_pcount_occ
+    g_vcount[uc] = g_vcount_occ
+    g_inten[uc]  = g_inten_occ
+    g_occ[uc]    = 1.0
+    g_pts_m2[uc] = g_pts_m2_occ
+
+    # ── pack directly into (H, W, N_CHANNELS) ────────────
+    grid = np.zeros((H, W, N_CHANNELS), dtype=np.float32)
+    grid[:, :, CH["height_max"]]   = g_hmax.reshape(H, W)
+    grid[:, :, CH["height_min"]]   = g_hmin.reshape(H, W)
+    grid[:, :, CH["height_range"]] = g_hrange.reshape(H, W)
+    grid[:, :, CH["height_mean"]]  = g_hmean.reshape(H, W)
+    grid[:, :, CH["point_count"]]  = g_pcount.reshape(H, W)
+    grid[:, :, CH["voxel_count"]]  = g_vcount.reshape(H, W)
+    grid[:, :, CH["intensity"]]    = g_inten.reshape(H, W)
+    grid[:, :, CH["is_occupied"]]  = g_occ.reshape(H, W)
+    grid[:, :, CH["pts_per_m2"]]   = g_pts_m2.reshape(H, W)
+
+    n_occ = len(unique_cells)
+    meta = {
+        "level":     level,
+        "H":         H,
+        "W":         W,
+        "vox_size":  vs,
+        "ix_min":    ix_min,
+        "iy_min":    iy_min,
+        "n_voxels":  int(mask.sum()),
+        "occupied":  n_occ,
+        "x_range_m": (float(ix_min * vs), float((ix_min + H) * vs)),
+        "y_range_m": (float(iy_min * vs), float((iy_min + W) * vs)),
+    }
+    return grid, meta
+
+
+def project_2d(features):
+    """
+    Project all three levels.
+    Bounds and masks are precomputed once, then each level projects.
+    Returns (grids, metas).
+    """
+    level_data = precompute_level_data(features)
+
+    grids = {}
+    metas = {}
+    for lv in [0, 1, 2]:
+        grid, meta = project_level(features, level_data[lv], lv)
+        if grid is not None:
+            grids[lv] = grid
+            metas[lv] = meta
+    return grids, metas
+
+
+# ─────────────────────────────────────────
+# SAVE / LOAD
+# ─────────────────────────────────────────
+def save_maps(grids, metas, frame_id, map_dir):
+    out = {}
+    for lv, grid in grids.items():
+        out[LEVEL_NAMES[lv]] = grid
+    meta_arr = np.array(
+        [[metas[lv]["H"], metas[lv]["W"],
+          metas[lv]["ix_min"], metas[lv]["iy_min"]]
+         for lv in sorted(metas.keys())],
+        dtype=np.int32,
+    )
+    out["meta_hwoff"] = meta_arr
+    path = os.path.join(map_dir, f"{frame_id}_map2d.npz")
+    np.savez_compressed(path, **out)
+    return path
+
+
+def load_maps(frame_id, map_dir):
+    path  = os.path.join(map_dir, f"{frame_id}_map2d.npz")
+    d     = np.load(path)
+    return {
+        0: d["L0_5cm"],
+        1: d["L1_15cm"],
+        2: d["L2_50cm"],
+    }
+
+
+# ─────────────────────────────────────────
+# VISUALIZATION
+# ─────────────────────────────────────────
+def visualize_map(grids, metas, frame_id, map_dir):
+    """
+    6-panel visualization:
+      Row 0: height_max, height_range, point_density  (L1)
+      Row 1: L0 / L1 / L2 elevation side by side
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f"2.5D Map — {frame_id}", fontsize=14)
+
+    level_labels = [
+        "L0 5cm (0–10m)",
+        "L1 15cm (10–30m)",
+        "L2 50cm (30–100m)",
+    ]
+
+    def plot_channel(ax, lv, ch_name, title, cmap):
+        grid = grids[lv]
+        occ  = grid[:, :, CH["is_occupied"]].astype(bool)
+        data = grid[:, :, CH[ch_name]].copy()
+        data[~occ] = np.nan
+        im = ax.imshow(data.T, origin="lower", cmap=cmap, aspect="equal")
+        plt.colorbar(im, ax=ax, shrink=0.8)
+        ax.set_title(title)
+        ax.set_xlabel("X cells")
+        ax.set_ylabel("Y cells")
+
+    plot_channel(axes[0, 0], 1, "height_max",   "Height Max — L1 15cm",   "RdYlGn")
+    plot_channel(axes[0, 1], 1, "height_range", "Height Range — L1 15cm", "hot")
+    plot_channel(axes[0, 2], 1, "point_count",  "Point Density — L1 15cm","plasma")
+
+    for col, lv in enumerate([0, 1, 2]):
+        ax   = axes[1, col]
+        grid = grids[lv]
+        meta = metas[lv]
+        occ  = grid[:, :, CH["is_occupied"]].astype(bool)
+        hmax = grid[:, :, CH["height_max"]].copy()
+        hmax[~occ] = np.nan
+
+        vmin = np.nanpercentile(hmax, 2)
+        vmax = np.nanpercentile(hmax, 98)
+        im   = ax.imshow(hmax.T, origin="lower", cmap="RdYlGn",
+                         vmin=vmin, vmax=vmax, aspect="equal")
+        plt.colorbar(im, ax=ax, shrink=0.8, label="m")
+
+        occ_pct = meta["occupied"] / (meta["H"] * meta["W"]) * 100
+        ax.set_title(
+            f"{level_labels[lv]}\n"
+            f"Grid {meta['H']}×{meta['W']}  Occ {occ_pct:.1f}%"
+        )
+        ax.set_xlabel("X cells")
+        ax.set_ylabel("Y cells")
+
+    plt.tight_layout()
+    path = os.path.join(map_dir, f"{frame_id}_map2d.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"  Saved plot → {path}")
+
+
+def visualize_composite(grids, metas, frame_id, map_dir):
+    """
+    Single composite top-down view combining all three levels.
+    Shows physical coordinates in metres.
+    """
+    fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+    ax.set_title(
+        f"Composite 2.5D Elevation Map — {frame_id}\n"
+        f"(all resolution zones)"
+    )
+
+    cmaps  = ["Blues", "Oranges", "Greens"]
+    alphas = [1.0, 0.85, 0.7]
+
+    for lv in [2, 1, 0]:           # coarse → fine (fine drawn on top)
+        grid = grids[lv]
+        meta = metas[lv]
+        vs   = meta["vox_size"]
+        occ  = grid[:, :, CH["is_occupied"]].astype(bool)
+        hmax = grid[:, :, CH["height_max"]].copy()
+        hmax[~occ] = np.nan
+
+        x0 = meta["ix_min"] * vs
+        x1 = (meta["ix_min"] + meta["H"]) * vs
+        y0 = meta["iy_min"] * vs
+        y1 = (meta["iy_min"] + meta["W"]) * vs
+
+        vmin = np.nanpercentile(hmax, 2)
+        vmax = np.nanpercentile(hmax, 98)
+
+        ax.imshow(
+            hmax.T,
+            origin="lower",
+            extent=[x0, x1, y0, y1],
+            cmap=cmaps[lv],
+            vmin=vmin, vmax=vmax,
+            alpha=alphas[lv],
+            aspect="equal",
+            interpolation="nearest",
+        )
+
+    theta = np.linspace(0, 2 * np.pi, 360)
+    for r, label in [(10, "10m"), (30, "30m")]:
+        ax.plot(r * np.cos(theta), r * np.sin(theta),
+                "w--", linewidth=1, alpha=0.6)
+        ax.text(r * 0.7, r * 0.7, label,
+                color="white", fontsize=8, alpha=0.8)
+
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+
+    from matplotlib.patches import Patch
+    legend = [
+        Patch(color="steelblue",  label="L0 5cm (0–10m)"),
+        Patch(color="darkorange", label="L1 15cm (10–30m)"),
+        Patch(color="green",      label="L2 50cm (30–100m)"),
+    ]
+    ax.legend(handles=legend, loc="upper right", fontsize=9)
+
+    path = os.path.join(map_dir, f"{frame_id}_composite.png")
+    plt.tight_layout()
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"  Saved composite → {path}")
+
+
+# ─────────────────────────────────────────
+# QUALITY CHECK
+# ─────────────────────────────────────────
+def map_quality_report(grids, metas):
+    print("\n── 2.5D Map Quality Report ──")
+    for lv in [0, 1, 2]:
+        grid   = grids[lv]
+        meta   = metas[lv]
+        occ    = grid[:, :, CH["is_occupied"]].astype(bool)
+        hmax   = grid[:, :, CH["height_max"]]
+        hmin   = grid[:, :, CH["height_min"]]
+        hrange = grid[:, :, CH["height_range"]]
+        pcount = grid[:, :, CH["point_count"]]
+        pts_m2 = grid[:, :, CH["pts_per_m2"]]
+
+        total_cells = meta["H"] * meta["W"]
+        occ_cells   = occ.sum()
+        occ_pct     = occ_cells / total_cells * 100
+
+        print(f"\n  {LEVEL_NAMES[lv]}")
+        print(f"    Grid size     : {meta['H']} × {meta['W']} = {total_cells:,} cells")
+        print(f"    Occupied      : {occ_cells:,} ({occ_pct:.1f}%)")
+        print(f"    X range       : {meta['x_range_m'][0]:.1f} – {meta['x_range_m'][1]:.1f} m")
+        print(f"    Y range       : {meta['y_range_m'][0]:.1f} – {meta['y_range_m'][1]:.1f} m")
+        print(f"    height_max    : min={hmax[occ].min():.2f}  "
+              f"mean={hmax[occ].mean():.2f}  max={hmax[occ].max():.2f} m")
+        print(f"    height_range  : min={hrange[occ].min():.3f}  "
+              f"mean={hrange[occ].mean():.3f}  max={hrange[occ].max():.3f} m")
+        print(f"    pts/m²        : mean={pts_m2[occ].mean():.1f}  max={pts_m2[occ].max():.1f}")
+
+        # Correctness: stronger check than just height_range >= 0
+        bad_order = (hmin[occ] > hmax[occ] + 1e-4).sum()
+        neg_range = (hrange[occ] < -1e-4).sum()
+        print(f"    ✓ height_min > height_max : {bad_order} "
+              f"{'✓' if bad_order == 0 else '✗ WARNING'}")
+        print(f"    ✓ Negative height_range   : {neg_range} "
+              f"{'✓' if neg_range == 0 else '✗ WARNING'}")
+
+
+# ─────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────
+print("=" * 80)
+print(f"{'Frame':<12} {'L0 grid':>12} {'L1 grid':>12} "
+      f"{'L2 grid':>12} {'Proj ms':>10} {'FPS':>6}")
+print("-" * 80)
+
+all_results = []
+
+for fpath in FILES:
+    fname    = os.path.basename(fpath)
+    fid      = os.path.splitext(fname)[0]
+    features = load_voxels(fid, SAVE_DIR)
+
+    t0            = time.perf_counter()
+    grids, metas  = project_2d(features)
+    proj_ms       = (time.perf_counter() - t0) * 1000
+
+    map_path = save_maps(grids, metas, fid, MAP_DIR)
+
+    l0 = metas[0]
+    l1 = metas[1]
+    l2 = metas[2]
+
+    result = dict(
+        frame   = fid,
+        proj_ms = proj_ms,
+        fps     = 1000 / proj_ms,
+        l0_hw   = (l0["H"], l0["W"]),
+        l1_hw   = (l1["H"], l1["W"]),
+        l2_hw   = (l2["H"], l2["W"]),
+        l0_occ  = l0["occupied"] / (l0["H"] * l0["W"]) * 100,
+        l1_occ  = l1["occupied"] / (l1["H"] * l1["W"]) * 100,
+        l2_occ  = l2["occupied"] / (l2["H"] * l2["W"]) * 100,
+    )
+    all_results.append(result)
+
+    print(f"{fname:<12} "
+          f"{l0['H']}×{l0['W']:>6} "
+          f"{l1['H']}×{l1['W']:>6} "
+          f"{l2['H']}×{l2['W']:>6} "
+          f"{proj_ms:>9.1f}ms "
+          f"{1000/proj_ms:>5.1f}")
+
+# ── quality + visuals for frame 0 ────────────────────────
+print("\nRunning quality report and visualization on 000000...")
+features_0       = load_voxels("000000", SAVE_DIR)
+grids_0, metas_0 = project_2d(features_0)
+map_quality_report(grids_0, metas_0)
+visualize_map(grids_0, metas_0, "000000", MAP_DIR)
+visualize_composite(grids_0, metas_0, "000000", MAP_DIR)
+
+# ── summary ──────────────────────────────────────────────
+def avg(k):
+    return np.mean([r[k] for r in all_results])
+
+print("\n" + "=" * 80)
+print("SUMMARY")
+print("=" * 80)
+print(f"  Avg projection time : {avg('proj_ms'):.1f} ms")
+print(f"  Avg FPS             : {avg('fps'):.1f}")
+print(f"  Min FPS             : {min(r['fps'] for r in all_results):.1f}")
+print(f"  Max FPS             : {max(r['fps'] for r in all_results):.1f}")
+print(f"\n  Avg L0 occupancy    : {avg('l0_occ'):.1f}%")
+print(f"  Avg L1 occupancy    : {avg('l1_occ'):.1f}%")
+print(f"  Avg L2 occupancy    : {avg('l2_occ'):.1f}%")
+
+print(f"\n  Voxelization FPS    : ~13.0")
+print(f"  Projection FPS      : {avg('fps'):.1f}")
+print(f"  Combined estimate   : {1000 / (1000/13 + avg('proj_ms')):.1f} FPS")
+
+total_kb = sum(
+    os.path.getsize(
+        os.path.join(MAP_DIR, f"{r['frame']}_map2d.npz")
+    ) / 1024
+    for r in all_results
+)
+print(f"\n  Map storage (10 frames) : {total_kb:.1f} KB = {total_kb/1024:.2f} MB")
+print(f"  Avg per frame           : {total_kb/len(all_results):.1f} KB")
+print(f"\nMaps saved to: {MAP_DIR}")
+
+# import numpy as np
+# import matplotlib.pyplot as plt
+# import os
+# import json
+# import time
+# from collections import Counter
+
+# # ─────────────────────────────────────────
+# # CONFIG
+# # ─────────────────────────────────────────
+# BANDS = [
+#     (0,  10,  0.05, 0),
+#     (10, 30,  0.15, 1),
+#     (30, 100, 0.50, 2),
+# ]
+
+# SIZE_MAP = np.array([0.05, 0.15, 0.50], dtype=np.float32)
+
+# FILES = [
+#     f"/content/semantic_kitti_sample/{i:06d}.bin"
+#     for i in range(10)
+# ]
+
+# SAVE_DIR = "/content/voxel_store"
+# os.makedirs(SAVE_DIR, exist_ok=True)
+
+# # ─────────────────────────────────────────
+# # PIPELINE
+# # ─────────────────────────────────────────
+# def load_points(path):
+#     return np.fromfile(path, dtype=np.float32).reshape(-1, 4)
+
+
+# class VoxelPipeline:
+#     def __init__(self, max_points=150000, max_voxels=100000):
+#         self.max_points = max_points
+#         self.max_voxels = max_voxels
+#         self.levels   = np.zeros(max_points, dtype=np.int32)
+#         self.vox_size = np.zeros(max_points, dtype=np.float32)
+#         self.dist     = np.zeros(max_points, dtype=np.float32)
+#         self.count    = np.zeros(max_voxels, dtype=np.int32)
+#         self.z_sum    = np.zeros(max_voxels, dtype=np.float64)
+#         self.z_sum2   = np.zeros(max_voxels, dtype=np.float64)
+#         self.z_min    = np.zeros(max_voxels, dtype=np.float64)
+#         self.z_max    = np.zeros(max_voxels, dtype=np.float64)
+#         self.i_sum    = np.zeros(max_voxels, dtype=np.float64)
+
+#     def process(self, points):
+#         N = len(points)
+
+#         # ── assign levels ──────────────────────────────
+#         dist     = self.dist[:N]
+#         levels   = self.levels[:N]
+#         vox_size = self.vox_size[:N]
+
+#         np.sqrt(points[:,0]**2 + points[:,1]**2, out=dist)
+
+#         levels[:]   = 2;  vox_size[:] = 0.50
+#         m1 = dist < 30;   levels[m1]  = 1; vox_size[m1] = 0.15
+#         m0 = dist < 10;   levels[m0]  = 0; vox_size[m0] = 0.05
+
+#         # ── hash grid ──────────────────────────────────
+#         coords = np.floor(
+#             points[:,:3] / vox_size[:,None]
+#         ).astype(np.int32)
+
+#         keys   = np.stack([levels,
+#                            coords[:,0],
+#                            coords[:,1],
+#                            coords[:,2]], axis=1).astype(np.int32)
+#         keys_c = np.ascontiguousarray(keys)
+#         keys_v = keys_c.view(
+#             np.dtype((np.void, keys_c.dtype.itemsize * 4))
+#         ).ravel()
+
+#         unique_void, inverse = np.unique(keys_v, return_inverse=True)
+#         unique_keys = unique_void.view(np.int32).reshape(-1, 4)
+
+#         sort_order     = np.argsort(inverse, kind='stable')
+#         sorted_inverse = inverse[sort_order]
+#         split_points   = np.searchsorted(
+#             sorted_inverse, np.arange(len(unique_keys))
+#         )
+
+#         # ── features ───────────────────────────────────
+#         V     = len(unique_keys)
+#         z     = points[:,2].astype(np.float64)
+#         inten = points[:,3].astype(np.float64)
+
+#         count  = self.count[:V];  count[:]  = 0
+#         z_sum  = self.z_sum[:V];  z_sum[:]  = 0
+#         z_sum2 = self.z_sum2[:V]; z_sum2[:] = 0
+#         z_min  = self.z_min[:V];  z_min[:]  =  np.inf
+#         z_max  = self.z_max[:V];  z_max[:]  = -np.inf
+#         i_sum  = self.i_sum[:V];  i_sum[:]  = 0
+
+#         np.add.at(count,  inverse, 1)
+#         np.add.at(z_sum,  inverse, z)
+#         np.add.at(z_sum2, inverse, z**2)
+#         np.minimum.at(z_min, inverse, z)
+#         np.maximum.at(z_max, inverse, z)
+#         np.add.at(i_sum,  inverse, inten)
+
+#         z_mean  = z_sum  / count
+#         z_var   = z_sum2 / count - z_mean**2
+#         z_range = z_max  - z_min
+#         i_mean  = i_sum  / count
+
+#         lv = unique_keys[:,0]
+#         vs = SIZE_MAP[lv]
+#         cx = (unique_keys[:,1] + 0.5) * vs
+#         cy = (unique_keys[:,2] + 0.5) * vs
+#         cz = (unique_keys[:,3] + 0.5) * vs
+
+#         return {
+#             "unique_keys":    unique_keys,
+#             "levels":         lv,
+#             "vox_size":       vs,
+#             "center_x":       cx,
+#             "center_y":       cy,
+#             "center_z":       cz,
+#             "point_count":    count.copy(),
+#             "height_mean":    z_mean.copy(),
+#             "height_min":     z_min.copy(),
+#             "height_max":     z_max.copy(),
+#             "height_var":     z_var.copy(),
+#             "height_range":   z_range.copy(),
+#             "intensity_mean": i_mean.copy(),
+#         }
+
+
+# # ─────────────────────────────────────────
+# # STORAGE
+# # ─────────────────────────────────────────
+# def save_voxels(features, frame_name, save_dir):
+#     """
+#     Save all voxel arrays as a single compressed .npz file.
+#     One file per frame. Loads back instantly with np.load.
+
+#     Stored arrays:
+#       keys        — (V,4) int32  [level, ix, iy, iz]
+#       levels      — (V,)  int32
+#       vox_size    — (V,)  float32
+#       center_xyz  — (V,3) float32  [cx, cy, cz]
+#       point_count — (V,)  int32
+#       height_mean — (V,)  float32
+#       height_min  — (V,)  float32
+#       height_max  — (V,)  float32
+#       height_var  — (V,)  float32
+#       height_range— (V,)  float32
+#       intensity   — (V,)  float32
+#     """
+#     frame_id = os.path.splitext(frame_name)[0]
+#     out_path = os.path.join(save_dir, f"{frame_id}_voxels.npz")
+
+#     center_xyz = np.stack([
+#         features["center_x"],
+#         features["center_y"],
+#         features["center_z"]
+#     ], axis=1).astype(np.float32)
+
+#     np.savez_compressed(
+#         out_path,
+#         keys         = features["unique_keys"].astype(np.int32),
+#         levels       = features["levels"].astype(np.int32),
+#         vox_size     = features["vox_size"].astype(np.float32),
+#         center_xyz   = center_xyz,
+#         point_count  = features["point_count"].astype(np.int32),
+#         height_mean  = features["height_mean"].astype(np.float32),
+#         height_min   = features["height_min"].astype(np.float32),
+#         height_max   = features["height_max"].astype(np.float32),
+#         height_var   = features["height_var"].astype(np.float32),
+#         height_range = features["height_range"].astype(np.float32),
+#         intensity    = features["intensity_mean"].astype(np.float32),
+#     )
+#     return out_path
+
+
+# def load_voxels(frame_id, save_dir):
+#     """
+#     Load a saved voxel frame back into a features dict.
+#     Usage: features = load_voxels("000000", SAVE_DIR)
+#     """
+#     path = os.path.join(save_dir, f"{frame_id}_voxels.npz")
+#     d    = np.load(path)
+#     return {
+#         "unique_keys":    d["keys"],
+#         "levels":         d["levels"],
+#         "vox_size":       d["vox_size"],
+#         "center_x":       d["center_xyz"][:,0],
+#         "center_y":       d["center_xyz"][:,1],
+#         "center_z":       d["center_xyz"][:,2],
+#         "point_count":    d["point_count"],
+#         "height_mean":    d["height_mean"],
+#         "height_min":     d["height_min"],
+#         "height_max":     d["height_max"],
+#         "height_var":     d["height_var"],
+#         "height_range":   d["height_range"],
+#         "intensity_mean": d["intensity"],
+#     }
+
+
+# def save_metadata(results, save_dir):
+#     """
+#     Save per-frame summary stats as JSON.
+#     Useful for the benchmark table later.
+#     """
+#     meta_path = os.path.join(save_dir, "metadata.json")
+#     with open(meta_path, "w") as f:
+#         json.dump(results, f, indent=2)
+#     return meta_path
+
+
+# # ─────────────────────────────────────────
+# # QUALITY REPORT
+# # ─────────────────────────────────────────
+# def voxel_quality_report(features, points):
+#     pcount = features["point_count"]
+#     hrange = features["height_range"]
+#     hvar   = features["height_var"]
+#     levels = features["levels"]
+
+#     print("=" * 60)
+#     print("VOXEL QUALITY REPORT")
+#     print("=" * 60)
+
+#     # ── overall ────────────────────────────────────────
+#     print(f"\n── Overall ──")
+#     print(f"  Total voxels      : {len(pcount):,}")
+#     print(f"  Total points      : {len(points):,}")
+#     print(f"  Compression ratio : {len(points)/len(pcount):.2f} pts/voxel")
+
+#     # ── points per voxel ───────────────────────────────
+#     print(f"\n── Points per voxel ──")
+#     print(f"  Min    : {pcount.min()}")
+#     print(f"  Max    : {pcount.max()}")
+#     print(f"  Mean   : {pcount.mean():.2f}")
+#     print(f"  Median : {np.median(pcount):.1f}")
+#     print(f"  1-pt voxels  : {(pcount==1).sum():,} "
+#           f"({(pcount==1).mean()*100:.1f}%)")
+#     print(f"  >10pt voxels : {(pcount>10).sum():,} "
+#           f"({(pcount>10).mean()*100:.1f}%)")
+
+#     # ── height range ───────────────────────────────────
+#     print(f"\n── Height range per voxel ──")
+#     print(f"  Min  : {hrange.min():.4f} m")
+#     print(f"  Max  : {hrange.max():.4f} m")
+#     print(f"  Mean : {hrange.mean():.4f} m")
+#     print(f"  Suspicious (>2m) : {(hrange>2).sum():,}")
+#     print(f"  Flat (=0m)       : {(hrange==0).sum():,}")
+
+#     # ── per level ──────────────────────────────────────
+#     print(f"\n── Per-level breakdown ──")
+#     size_labels = {0: "5cm", 1: "15cm", 2: "50cm"}
+#     for lv in [0, 1, 2]:
+#         mask = levels == lv
+#         if mask.sum() == 0:
+#             continue
+#         pc = pcount[mask]
+#         hr = hrange[mask]
+#         print(f"\n  L{lv} ({size_labels[lv]}) — {mask.sum():,} voxels")
+#         print(f"    pts/voxel : "
+#               f"min={pc.min()} "
+#               f"mean={pc.mean():.2f} "
+#               f"max={pc.max()}")
+#         print(f"    height_range : "
+#               f"min={hr.min():.3f} "
+#               f"mean={hr.mean():.3f} "
+#               f"max={hr.max():.3f}")
+#         print(f"    single-pt : {(pc==1).sum():,} "
+#               f"({(pc==1).mean()*100:.1f}%)")
+
+#     # ── spatial coverage ───────────────────────────────
+#     print(f"\n── Spatial coverage ──")
+#     print(f"  X : {features['center_x'].min():.1f} "
+#           f"to {features['center_x'].max():.1f} m")
+#     print(f"  Y : {features['center_y'].min():.1f} "
+#           f"to {features['center_y'].max():.1f} m")
+#     print(f"  Z : {features['center_z'].min():.1f} "
+#           f"to {features['center_z'].max():.1f} m")
+
+
+# def check_zone_boundaries(features):
+#     print(f"\n── Zone boundary check ──")
+#     cx   = features["center_x"]
+#     cy   = features["center_y"]
+#     lv   = features["levels"]
+#     dist = np.sqrt(cx**2 + cy**2)
+
+#     for boundary, lo, hi, lv_a, lv_b in [
+#         (10, 8,  12, 0, 1),
+#         (30, 28, 32, 1, 2),
+#     ]:
+#         zone = (dist > lo) & (dist < hi)
+#         if zone.sum() == 0:
+#             continue
+#         la = (lv[zone] == lv_a).sum()
+#         lb = (lv[zone] == lv_b).sum()
+#         print(f"\n  {lo}–{hi}m (around {boundary}m boundary)")
+#         print(f"    L{lv_a} voxels : {la}")
+#         print(f"    L{lv_b} voxels : {lb}")
+
+#     # Use tolerance of half a 50cm voxel = 0.25m
+#     TOLERANCE = 0.25
+#     l0_far  = ((lv == 0) & (dist > 10 + TOLERANCE)).sum()
+#     l2_near = ((lv == 2) & (dist < 30 - TOLERANCE)).sum()
+
+#     print(f"\n  L0 voxels beyond {10+TOLERANCE}m : {l0_far} "
+#           f"{'✓' if l0_far==0 else '✗ WARNING'}")
+#     print(f"  L2 voxels within {30-TOLERANCE}m : {l2_near} "
+#           f"{'✓' if l2_near==0 else '✗ WARNING'}")
+#     print(f"  (tolerance = {TOLERANCE}m = half one L2 voxel width)")
+
+# # ─────────────────────────────────────────
+# # QUALITY PLOTS
+# # ─────────────────────────────────────────
+# def voxel_quality_plots(features, frame_name, save_dir):
+#     pcount = features["point_count"]
+#     hrange = features["height_range"]
+#     hvar   = features["height_var"]
+#     levels = features["levels"]
+#     cx     = features["center_x"]
+#     cy     = features["center_y"]
+
+#     colors = ['steelblue', 'darkorange', 'green']
+#     labels = ['L0 5cm (0–10m)',
+#               'L1 15cm (10–30m)',
+#               'L2 50cm (30–100m)']
+
+#     fig, axes = plt.subplots(2, 3, figsize=(16, 9))
+#     fig.suptitle(f"Voxel Quality — {frame_name}", fontsize=14)
+
+#     # ── 1: points per voxel ────────────────────────────
+#     ax = axes[0, 0]
+#     for lv in [0, 1, 2]:
+#         mask = levels == lv
+#         ax.hist(pcount[mask], bins=50, alpha=0.6,
+#                 color=colors[lv], label=labels[lv])
+#     ax.set_xlabel("Points per voxel")
+#     ax.set_ylabel("Voxel count (log)")
+#     ax.set_title("Points per Voxel")
+#     ax.legend(fontsize=8)
+#     ax.set_yscale('log')
+
+#     # ── 2: height range ────────────────────────────────
+#     ax = axes[0, 1]
+#     for lv in [0, 1, 2]:
+#         mask = levels == lv
+#         ax.hist(hrange[mask], bins=50, alpha=0.6,
+#                 color=colors[lv], label=labels[lv])
+#     ax.set_xlabel("Height range (m)")
+#     ax.set_title("Height Range Distribution")
+#     ax.legend(fontsize=8)
+
+#     # ── 3: height std dev ──────────────────────────────
+#     ax = axes[0, 2]
+#     for lv in [0, 1, 2]:
+#         mask = levels == lv
+#         ax.hist(np.sqrt(hvar[mask] + 1e-9),
+#                 bins=50, alpha=0.6,
+#                 color=colors[lv], label=labels[lv])
+#     ax.set_xlabel("Height std dev (m)")
+#     ax.set_title("Height Variance Distribution")
+#     ax.legend(fontsize=8)
+
+#     # ── 4: top-down by level ───────────────────────────
+#     ax = axes[1, 0]
+#     for lv in [0, 1, 2]:
+#         mask = levels == lv
+#         ax.scatter(cx[mask], cy[mask],
+#                    s=0.3, alpha=0.4,
+#                    color=colors[lv], label=labels[lv])
+#     # Draw boundary rings
+#     for r, c in [(10,'red'), (30,'purple')]:
+#         circle = plt.Circle((0,0), r, color=c,
+#                              fill=False, linewidth=1,
+#                              linestyle='--', alpha=0.7)
+#         ax.add_patch(circle)
+#     ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)")
+#     ax.set_title("Top-down: Resolution Zones")
+#     ax.legend(fontsize=7, markerscale=5)
+#     ax.set_aspect('equal')
+
+#     # ── 5: point density ───────────────────────────────
+#     ax = axes[1, 1]
+#     sc = ax.scatter(cx, cy,
+#                     c=np.log1p(pcount),
+#                     s=0.3, alpha=0.5, cmap='plasma')
+#     plt.colorbar(sc, ax=ax, label='log(point count)')
+#     ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)")
+#     ax.set_title("Top-down: Point Density")
+#     ax.set_aspect('equal')
+
+#     # ── 6: mean height ─────────────────────────────────
+#     ax = axes[1, 2]
+#     sc = ax.scatter(cx, cy,
+#                     c=features["height_mean"],
+#                     s=0.3, alpha=0.5, cmap='RdYlGn')
+#     plt.colorbar(sc, ax=ax, label='mean height (m)')
+#     ax.set_xlabel("X (m)"); ax.set_ylabel("Y (m)")
+#     ax.set_title("Top-down: Mean Height")
+#     ax.set_aspect('equal')
+
+#     plt.tight_layout()
+#     plot_path = os.path.join(
+#         save_dir,
+#         f"{os.path.splitext(frame_name)[0]}_quality.png"
+#     )
+#     plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+#     plt.show()
+#     print(f"Saved: {plot_path}")
+
+
+# # ─────────────────────────────────────────
+# # STORAGE VERIFICATION
+# # ─────────────────────────────────────────
+# def verify_storage(frame_id, save_dir, original_features):
+#     """
+#     Load saved voxels back and confirm they match original.
+#     """
+#     print(f"\n── Storage verification: {frame_id} ──")
+#     loaded = load_voxels(frame_id, save_dir)
+
+#     checks = [
+#         ("voxel count",
+#          len(loaded["unique_keys"]) == len(original_features["unique_keys"])),
+#         ("height_mean match",
+#          np.allclose(loaded["height_mean"],
+#                      original_features["height_mean"].astype(np.float32),
+#                      atol=1e-4)),
+#         ("height_min match",
+#          np.allclose(loaded["height_min"],
+#                      original_features["height_min"].astype(np.float32),
+#                      atol=1e-4)),
+#         ("point_count match",
+#          np.array_equal(loaded["point_count"],
+#                         original_features["point_count"])),
+#         ("levels match",
+#          np.array_equal(loaded["levels"],
+#                         original_features["levels"])),
+#     ]
+
+#     all_ok = True
+#     for name, result in checks:
+#         status = "✓" if result else "✗"
+#         print(f"  {status} {name}")
+#         if not result:
+#             all_ok = False
+
+#     # File size
+#     npz_path = os.path.join(save_dir, f"{frame_id}_voxels.npz")
+#     size_kb  = os.path.getsize(npz_path) / 1024
+#     print(f"  File size : {size_kb:.1f} KB")
+#     return all_ok
+
+
+# # ─────────────────────────────────────────
+# # MAIN
+# # ─────────────────────────────────────────
+# pipeline = VoxelPipeline(max_points=150000, max_voxels=100000)
+# _ = pipeline.process(load_points(FILES[0]))  # warmup
+
+# all_meta = []
+
+# for fpath in FILES:
+#     fname  = os.path.basename(fpath)
+#     fid    = os.path.splitext(fname)[0]
+
+#     print(f"\n{'='*60}")
+#     print(f"Processing {fname}")
+#     print(f"{'='*60}")
+
+#     # ── run pipeline ───────────────────────────────────
+#     points   = load_points(fpath)
+#     t0       = time.perf_counter()
+#     features = pipeline.process(points)
+#     elapsed  = (time.perf_counter() - t0) * 1000
+
+#     # ── save voxels ────────────────────────────────────
+#     out_path = save_voxels(features, fname, SAVE_DIR)
+#     print(f"Saved voxels → {out_path}")
+
+#     # ── quality report ─────────────────────────────────
+#     voxel_quality_report(features, points)
+#     check_zone_boundaries(features)
+
+#     # ── plots (first frame only to avoid too many images)
+#     if fid == "000000":
+#         voxel_quality_plots(features, fname, SAVE_DIR)
+
+#     # ── verify storage ─────────────────────────────────
+#     verify_storage(fid, SAVE_DIR, features)
+
+#     # ── collect metadata ───────────────────────────────
+#     pcount = features["point_count"]
+#     all_meta.append({
+#         "frame":         fid,
+#         "n_points":      int(len(points)),
+#         "n_voxels":      int(len(features["unique_keys"])),
+#         "n_l0":          int((features["levels"]==0).sum()),
+#         "n_l1":          int((features["levels"]==1).sum()),
+#         "n_l2":          int((features["levels"]==2).sum()),
+#         "pts_per_voxel": float(pcount.mean()),
+#         "height_range_mean": float(features["height_range"].mean()),
+#         "pipeline_ms":   float(elapsed),
+#         "fps":           float(1000/elapsed),
+#         "npz_size_kb":   float(
+#             os.path.getsize(
+#                 os.path.join(SAVE_DIR, f"{fid}_voxels.npz")
+#             ) / 1024
+#         ),
+#     })
+
+# # ── save metadata ──────────────────────────────────────
+# meta_path = save_metadata(all_meta, SAVE_DIR)
+# print(f"\nMetadata saved → {meta_path}")
+
+# # ── final storage summary ──────────────────────────────
+# print("\n" + "="*70)
+# print("STORAGE SUMMARY")
+# print("="*70)
+# print(f"{'Frame':<12} {'Voxels':>8} {'pts/vox':>8} "
+#       f"{'FPS':>6} {'File KB':>8}")
+# print("-"*70)
+# for m in all_meta:
+#     print(f"{m['frame']:<12} {m['n_voxels']:>8,} "
+#           f"{m['pts_per_voxel']:>8.2f} "
+#           f"{m['fps']:>6.1f} "
+#           f"{m['npz_size_kb']:>8.1f}")
+
+# total_kb = sum(m['npz_size_kb'] for m in all_meta)
+# print(f"\n  Total storage (10 frames) : {total_kb:.1f} KB "
+#       f"= {total_kb/1024:.2f} MB")
+# print(f"  Avg per frame             : {total_kb/len(all_meta):.1f} KB")
+# print(f"\nFiles saved to: {SAVE_DIR}")
+# print("\nTo reload any frame later:")
+# print('  features = load_voxels("000000", SAVE_DIR)')
+
+# import numpy as np
+# import matplotlib.pyplot as plt
+# import matplotlib.colors as mcolors
+# import os
+# import time
+
+# # ─────────────────────────────────────────
+# # CONFIG
+# # ─────────────────────────────────────────
+# SAVE_DIR   = "/content/voxel_store"
+# MAP_DIR    = "/content/maps_2d"
+# os.makedirs(MAP_DIR, exist_ok=True)
+
+# SIZE_MAP   = np.array([0.05, 0.15, 0.50], dtype=np.float32)
+# LEVEL_NAMES = {0: "L0_5cm", 1: "L1_15cm", 2: "L2_50cm"}
+
+# # Feature channel indices inside the grid array
+# CH = {
+#     "height_max":    0,
+#     "height_min":    1,
+#     "height_range":  2,
+#     "height_mean":   3,
+#     "point_count":   4,
+#     "voxel_count":   5,
+#     "intensity":     6,
+#     "is_occupied":   7,
+#     "pts_per_m2":    8,
+# }
+# N_CHANNELS = len(CH)
+
+# FILES = [
+#     f"/kaggle/input/datasets/hbenallal/semantickitti/dataset/sequences/00/velodyne/{i:06d}.bin"
+#     for i in range(10)
+# ]
+
+# # ─────────────────────────────────────────
+# # LOAD SAVED VOXELS
+# # ─────────────────────────────────────────
+# def load_voxels(frame_id, save_dir):
+#     path = os.path.join(save_dir, f"{frame_id}_voxels.npz")
+#     d    = np.load(path)
+#     return {
+#         "unique_keys":    d["keys"],
+#         "levels":         d["levels"],
+#         "vox_size":       d["vox_size"],
+#         "center_x":       d["center_xyz"][:,0],
+#         "center_y":       d["center_xyz"][:,1],
+#         "center_z":       d["center_xyz"][:,2],
+#         "point_count":    d["point_count"],
+#         "height_mean":    d["height_mean"],
+#         "height_min":     d["height_min"],
+#         "height_max":     d["height_max"],
+#         "height_var":     d["height_var"],
+#         "height_range":   d["height_range"],
+#         "intensity_mean": d["intensity"],
+#     }
+
+
+# # ─────────────────────────────────────────
+# # GRID DIMENSIONS
+# # ─────────────────────────────────────────
+# def compute_grid_bounds(features, level):
+#     """
+#     Compute grid size for one level based on actual
+#     voxel center positions. Returns (grid, ix, iy, offset_x, offset_y).
+#     """
+#     mask = features["levels"] == level
+#     if mask.sum() == 0:
+#         return None, None, None, None, None
+
+#     vs  = SIZE_MAP[level]
+#     cx  = features["center_x"][mask]
+#     cy  = features["center_y"][mask]
+
+#     # Voxel indices in 2D (drop Z)
+#     ix  = np.floor(cx / vs).astype(np.int32)
+#     iy  = np.floor(cy / vs).astype(np.int32)
+
+#     # Shift to zero-based indices
+#     ix_min = ix.min()
+#     iy_min = iy.min()
+#     ix_rel = ix - ix_min
+#     iy_rel = iy - iy_min
+
+#     H = ix_rel.max() + 1   # rows = X axis
+#     W = iy_rel.max() + 1   # cols = Y axis
+
+#     return H, W, ix_rel, iy_rel, ix_min, iy_min, mask
+
+
+# # ─────────────────────────────────────────
+# # CORE PROJECTION — fully vectorized
+# # ─────────────────────────────────────────
+# def project_level(features, level):
+#     """
+#     Project all voxels of one level into a 2D grid.
+#     Returns grid of shape (H, W, N_CHANNELS).
+
+#     Aggregation per cell:
+#       height_max   → max of voxel height_max
+#       height_min   → min of voxel height_min
+#       height_range → cell height_max - cell height_min  (recomputed)
+#       height_mean  → point-weighted mean
+#       point_count  → sum
+#       voxel_count  → count of contributing voxels
+#       intensity    → point-weighted mean
+#       is_occupied  → 1 if any voxel contributes
+#       pts_per_m2   → point_count / cell_area
+#     """
+#     result = compute_grid_bounds(features, level)
+#     if result[0] is None:
+#         return None, None
+
+#     H, W, ix_rel, iy_rel, ix_min, iy_min, mask = result
+#     vs       = SIZE_MAP[level]
+#     cell_area = float(vs) ** 2
+
+#     # Extract masked arrays
+#     h_max  = features["height_max"][mask].astype(np.float32)
+#     h_min  = features["height_min"][mask].astype(np.float32)
+#     h_mean = features["height_mean"][mask].astype(np.float32)
+#     pcount = features["point_count"][mask].astype(np.float32)
+#     inten  = features["intensity_mean"][mask].astype(np.float32)
+
+#     # Flat cell indices for vectorized scatter
+#     flat = ix_rel * W + iy_rel
+#     C    = H * W
+
+#     # ── accumulate ──────────────────────────────────────
+
+#     # height_max → max
+#     g_hmax = np.full(C, -np.inf, dtype=np.float32)
+#     np.maximum.at(g_hmax, flat, h_max)
+
+#     # height_min → min
+#     g_hmin = np.full(C,  np.inf, dtype=np.float32)
+#     np.minimum.at(g_hmin, flat, h_min)
+
+#     # point_count → sum
+#     g_pcount = np.zeros(C, dtype=np.float32)
+#     np.add.at(g_pcount, flat, pcount)
+
+#     # voxel_count → count
+#     g_vcount = np.zeros(C, dtype=np.float32)
+#     np.add.at(g_vcount, flat, 1)
+
+#     # height_mean → point-weighted sum (divide later)
+#     g_hmean_num = np.zeros(C, dtype=np.float32)
+#     np.add.at(g_hmean_num, flat, h_mean * pcount)
+
+#     # intensity → point-weighted sum (divide later)
+#     g_inten_num = np.zeros(C, dtype=np.float32)
+#     np.add.at(g_inten_num, flat, inten * pcount)
+
+#     # ── derived ─────────────────────────────────────────
+
+#     # occupied mask
+#     occupied = g_vcount > 0
+
+#     # point-weighted means (only where occupied)
+#     g_hmean = np.zeros(C, dtype=np.float32)
+#     g_inten = np.zeros(C, dtype=np.float32)
+#     g_hmean[occupied] = (g_hmean_num[occupied]
+#                          / g_pcount[occupied])
+#     g_inten[occupied] = (g_inten_num[occupied]
+#                          / g_pcount[occupied])
+
+#     # height_range recomputed from aggregated min/max
+#     g_hrange = np.zeros(C, dtype=np.float32)
+#     g_hrange[occupied] = (g_hmax[occupied]
+#                           - g_hmin[occupied])
+
+#     # pts_per_m²
+#     g_pts_m2 = g_pcount / cell_area
+
+#     # fix uninitialised -inf / +inf in empty cells
+#     g_hmax[~occupied] = 0.0
+#     g_hmin[~occupied] = 0.0
+
+#     # ── pack into (H, W, N_CHANNELS) ────────────────────
+#     grid = np.zeros((H, W, N_CHANNELS), dtype=np.float32)
+#     for ch_name, ch_idx in CH.items():
+#         arr = {
+#             "height_max":   g_hmax,
+#             "height_min":   g_hmin,
+#             "height_range": g_hrange,
+#             "height_mean":  g_hmean,
+#             "point_count":  g_pcount,
+#             "voxel_count":  g_vcount,
+#             "intensity":    g_inten,
+#             "is_occupied":  occupied.astype(np.float32),
+#             "pts_per_m2":   g_pts_m2,
+#         }[ch_name]
+#         grid[:, :, ch_idx] = arr.reshape(H, W)
+
+#     meta = {
+#         "level":    level,
+#         "H":        H,
+#         "W":        W,
+#         "vox_size": float(vs),
+#         "ix_min":   int(ix_min),
+#         "iy_min":   int(iy_min),
+#         "n_voxels": int(mask.sum()),
+#         "occupied": int(occupied.sum()),
+#         "x_range_m": (float(ix_min * vs),
+#                       float((ix_min + H) * vs)),
+#         "y_range_m": (float(iy_min * vs),
+#                       float((iy_min + W) * vs)),
+#     }
+#     return grid, meta
+
+
+# def project_2d(features):
+#     """
+#     Project all three levels. Returns grids dict and metas dict.
+#     """
+#     grids = {}
+#     metas = {}
+#     for lv in [0, 1, 2]:
+#         grid, meta = project_level(features, lv)
+#         if grid is not None:
+#             grids[lv] = grid
+#             metas[lv] = meta
+#     return grids, metas
+
+
+# # ─────────────────────────────────────────
+# # SAVE / LOAD
+# # ─────────────────────────────────────────
+# def save_maps(grids, metas, frame_id, map_dir):
+#     out = {}
+#     for lv, grid in grids.items():
+#         key      = LEVEL_NAMES[lv]
+#         out[key] = grid
+#     meta_arr = np.array([
+#         [metas[lv]["H"], metas[lv]["W"],
+#          metas[lv]["ix_min"], metas[lv]["iy_min"]]
+#         for lv in sorted(metas.keys())
+#     ], dtype=np.int32)
+#     out["meta_hwoff"] = meta_arr
+
+#     path = os.path.join(map_dir, f"{frame_id}_map2d.npz")
+#     np.savez_compressed(path, **out)
+#     return path
+
+
+# def load_maps(frame_id, map_dir):
+#     path = os.path.join(map_dir, f"{frame_id}_map2d.npz")
+#     d    = np.load(path)
+#     grids = {
+#         0: d["L0_5cm"],
+#         1: d["L1_15cm"],
+#         2: d["L2_50cm"],
+#     }
+#     return grids
+
+
+# # ─────────────────────────────────────────
+# # VISUALIZATION
+# # ─────────────────────────────────────────
+# def visualize_map(grids, metas, frame_id, map_dir):
+#     """
+#     6-panel visualization:
+#       Row 0: height_max, height_range, point_density
+#       Row 1: L0 / L1 / L2 elevation side by side
+#     """
+#     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+#     fig.suptitle(f"2.5D Map — {frame_id}", fontsize=14)
+
+#     colors_level = ['steelblue', 'darkorange', 'green']
+#     level_labels = ['L0 5cm (0–10m)',
+#                     'L1 15cm (10–30m)',
+#                     'L2 50cm (30–100m)']
+
+#     # ── Row 0: combined stats (use L1 as representative) ──
+
+#     def plot_channel(ax, lv, ch_name, title, cmap):
+#         grid = grids[lv]
+#         occ  = grid[:, :, CH["is_occupied"]].astype(bool)
+#         data = grid[:, :, CH[ch_name]].copy()
+#         data[~occ] = np.nan
+#         im = ax.imshow(data.T, origin='lower',
+#                        cmap=cmap, aspect='equal')
+#         plt.colorbar(im, ax=ax, shrink=0.8)
+#         ax.set_title(title)
+#         ax.set_xlabel("X cells")
+#         ax.set_ylabel("Y cells")
+
+#     plot_channel(axes[0,0], 1, "height_max",
+#                  "Height Max — L1 15cm", "RdYlGn")
+#     plot_channel(axes[0,1], 1, "height_range",
+#                  "Height Range — L1 15cm", "hot")
+#     plot_channel(axes[0,2], 1, "point_count",
+#                  "Point Density — L1 15cm", "plasma")
+
+#     # ── Row 1: elevation per level ─────────────────────
+#     for col, lv in enumerate([0, 1, 2]):
+#         ax   = axes[1, col]
+#         grid = grids[lv]
+#         occ  = grid[:, :, CH["is_occupied"]].astype(bool)
+#         hmax = grid[:, :, CH["height_max"]].copy()
+#         hmax[~occ] = np.nan
+
+#         vmin = np.nanpercentile(hmax, 2)
+#         vmax = np.nanpercentile(hmax, 98)
+
+#         im = ax.imshow(hmax.T, origin='lower',
+#                        cmap='RdYlGn',
+#                        vmin=vmin, vmax=vmax,
+#                        aspect='equal')
+#         plt.colorbar(im, ax=ax, shrink=0.8, label='m')
+
+#         meta = metas[lv]
+#         occ_pct = meta["occupied"] / (meta["H"] * meta["W"]) * 100
+#         ax.set_title(
+#             f"{level_labels[lv]}\n"
+#             f"Grid {meta['H']}×{meta['W']}  "
+#             f"Occ {occ_pct:.1f}%"
+#         )
+#         ax.set_xlabel("X cells")
+#         ax.set_ylabel("Y cells")
+
+#     plt.tight_layout()
+#     path = os.path.join(map_dir, f"{frame_id}_map2d.png")
+#     plt.savefig(path, dpi=150, bbox_inches='tight')
+#     plt.show()
+#     print(f"  Saved plot → {path}")
+
+
+# def visualize_composite(grids, metas, frame_id, map_dir):
+#     """
+#     Single composite top-down view combining all three levels.
+#     Shows physical coordinates in metres.
+#     """
+#     fig, ax = plt.subplots(1, 1, figsize=(12, 10))
+#     ax.set_title(
+#         f"Composite 2.5D Elevation Map — {frame_id}\n"
+#         f"(all resolution zones)"
+#     )
+
+#     cmaps  = ['Blues', 'Oranges', 'Greens']
+#     alphas = [1.0, 0.85, 0.7]
+
+#     for lv in [2, 1, 0]:       # draw coarse first, fine on top
+#         grid = grids[lv]
+#         meta = metas[lv]
+#         vs   = meta["vox_size"]
+#         occ  = grid[:, :, CH["is_occupied"]].astype(bool)
+#         hmax = grid[:, :, CH["height_max"]].copy()
+#         hmax[~occ] = np.nan
+
+#         # Physical extent in metres
+#         x0 = meta["ix_min"] * vs
+#         x1 = (meta["ix_min"] + meta["H"]) * vs
+#         y0 = meta["iy_min"] * vs
+#         y1 = (meta["iy_min"] + meta["W"]) * vs
+
+#         vmin = np.nanpercentile(hmax, 2)
+#         vmax = np.nanpercentile(hmax, 98)
+
+#         ax.imshow(
+#             hmax.T,
+#             origin='lower',
+#             extent=[x0, x1, y0, y1],
+#             cmap=cmaps[lv],
+#             vmin=vmin, vmax=vmax,
+#             alpha=alphas[lv],
+#             aspect='equal',
+#             interpolation='nearest',
+#         )
+
+#     # Draw zone boundary rings
+#     theta = np.linspace(0, 2*np.pi, 360)
+#     for r, label in [(10, '10m'), (30, '30m')]:
+#         ax.plot(r*np.cos(theta), r*np.sin(theta),
+#                 'w--', linewidth=1, alpha=0.6)
+#         ax.text(r*0.7, r*0.7, label,
+#                 color='white', fontsize=8, alpha=0.8)
+
+#     ax.set_xlabel("X (m)")
+#     ax.set_ylabel("Y (m)")
+
+#     # Legend
+#     from matplotlib.patches import Patch
+#     legend = [
+#         Patch(color='steelblue', label='L0 5cm (0–10m)'),
+#         Patch(color='darkorange', label='L1 15cm (10–30m)'),
+#         Patch(color='green',     label='L2 50cm (30–100m)'),
+#     ]
+#     ax.legend(handles=legend, loc='upper right', fontsize=9)
+
+#     path = os.path.join(map_dir, f"{frame_id}_composite.png")
+#     plt.tight_layout()
+#     plt.savefig(path, dpi=150, bbox_inches='tight')
+#     plt.show()
+#     print(f"  Saved composite → {path}")
+
+
+# # ─────────────────────────────────────────
+# # QUALITY CHECK
+# # ─────────────────────────────────────────
+# def map_quality_report(grids, metas):
+#     print("\n── 2.5D Map Quality Report ──")
+#     for lv in [0, 1, 2]:
+#         grid = grids[lv]
+#         meta = metas[lv]
+#         occ  = grid[:, :, CH["is_occupied"]].astype(bool)
+#         hmax = grid[:, :, CH["height_max"]]
+#         hrange = grid[:, :, CH["height_range"]]
+#         pcount = grid[:, :, CH["point_count"]]
+#         pts_m2 = grid[:, :, CH["pts_per_m2"]]
+
+#         total_cells = meta["H"] * meta["W"]
+#         occ_cells   = occ.sum()
+#         occ_pct     = occ_cells / total_cells * 100
+
+#         print(f"\n  {LEVEL_NAMES[lv]}")
+#         print(f"    Grid size     : {meta['H']} × {meta['W']} "
+#               f"= {total_cells:,} cells")
+#         print(f"    Occupied      : {occ_cells:,} "
+#               f"({occ_pct:.1f}%)")
+#         print(f"    X range       : "
+#               f"{meta['x_range_m'][0]:.1f} – "
+#               f"{meta['x_range_m'][1]:.1f} m")
+#         print(f"    Y range       : "
+#               f"{meta['y_range_m'][0]:.1f} – "
+#               f"{meta['y_range_m'][1]:.1f} m")
+#         print(f"    height_max    : "
+#               f"min={hmax[occ].min():.2f}  "
+#               f"mean={hmax[occ].mean():.2f}  "
+#               f"max={hmax[occ].max():.2f} m")
+#         print(f"    height_range  : "
+#               f"min={hrange[occ].min():.3f}  "
+#               f"mean={hrange[occ].mean():.3f}  "
+#               f"max={hrange[occ].max():.3f} m")
+#         print(f"    pts/m²        : "
+#               f"mean={pts_m2[occ].mean():.1f}  "
+#               f"max={pts_m2[occ].max():.1f}")
+
+#         # Correctness checks
+#         neg_range = (hrange[occ] < -1e-4).sum()
+#         print(f"    ✓ Negative height_range : {neg_range} "
+#               f"{'✓' if neg_range==0 else '✗ WARNING'}")
+
+
+# # ─────────────────────────────────────────
+# # MAIN LOOP
+# # ─────────────────────────────────────────
+# print("=" * 80)
+# print(f"{'Frame':<12} {'L0 grid':>12} {'L1 grid':>12} "
+#       f"{'L2 grid':>12} {'Proj ms':>10} {'FPS':>6}")
+# print("-" * 80)
+
+# all_results = []
+
+# for fpath in FILES:
+#     fname    = os.path.basename(fpath)
+#     fid      = os.path.splitext(fname)[0]
+#     features = load_voxels(fid, SAVE_DIR)
+
+#     # ── time projection only ──────────────────────────
+#     t0          = time.perf_counter()
+#     grids, metas = project_2d(features)
+#     proj_ms     = (time.perf_counter() - t0) * 1000
+
+#     # ── save ─────────────────────────────────────────
+#     map_path = save_maps(grids, metas, fid, MAP_DIR)
+
+#     l0 = metas[0]
+#     l1 = metas[1]
+#     l2 = metas[2]
+
+#     result = dict(
+#         frame   = fid,
+#         proj_ms = proj_ms,
+#         fps     = 1000 / proj_ms,
+#         l0_hw   = (l0["H"], l0["W"]),
+#         l1_hw   = (l1["H"], l1["W"]),
+#         l2_hw   = (l2["H"], l2["W"]),
+#         l0_occ  = l0["occupied"] / (l0["H"]*l0["W"]) * 100,
+#         l1_occ  = l1["occupied"] / (l1["H"]*l1["W"]) * 100,
+#         l2_occ  = l2["occupied"] / (l2["H"]*l2["W"]) * 100,
+#     )
+#     all_results.append(result)
+
+#     print(f"{fname:<12} "
+#           f"{l0['H']}×{l0['W']:>6} "
+#           f"{l1['H']}×{l1['W']:>6} "
+#           f"{l2['H']}×{l2['W']:>6} "
+#           f"{proj_ms:>9.1f}ms "
+#           f"{1000/proj_ms:>5.1f}")
+
+# # ── quality + visuals for frame 0 ────────────────────
+# print("\nRunning quality report and visualization on 000000...")
+# features_0    = load_voxels("000000", SAVE_DIR)
+# grids_0, metas_0 = project_2d(features_0)
+# map_quality_report(grids_0, metas_0)
+# visualize_map(grids_0, metas_0, "000000", MAP_DIR)
+# visualize_composite(grids_0, metas_0, "000000", MAP_DIR)
+
+# # ── summary ───────────────────────────────────────────
+# import numpy as np
+# def avg(k): return np.mean([r[k] for r in all_results])
+
+# print("\n" + "=" * 80)
+# print("SUMMARY")
+# print("=" * 80)
+# print(f"  Avg projection time : {avg('proj_ms'):.1f} ms")
+# print(f"  Avg FPS             : {avg('fps'):.1f}")
+# print(f"  Min FPS             : "
+#       f"{min(r['fps'] for r in all_results):.1f}")
+# print(f"  Max FPS             : "
+#       f"{max(r['fps'] for r in all_results):.1f}")
+# print(f"\n  Avg L0 occupancy    : {avg('l0_occ'):.1f}%")
+# print(f"  Avg L1 occupancy    : {avg('l1_occ'):.1f}%")
+# print(f"  Avg L2 occupancy    : {avg('l2_occ'):.1f}%")
+
+# print(f"\n  Voxelization FPS    : ~13.0")
+# print(f"  Projection FPS      : {avg('fps'):.1f}")
+# print(f"  Combined estimate   : "
+#       f"{1000/(1000/13 + avg('proj_ms')):.1f} FPS")
+
+# total_kb = sum(
+#     os.path.getsize(
+#         os.path.join(MAP_DIR, f"{r['frame']}_map2d.npz")
+#     ) / 1024
+#     for r in all_results
+# )
+# print(f"\n  Map storage (10 frames) : {total_kb:.1f} KB "
+#       f"= {total_kb/1024:.2f} MB")
+# print(f"  Avg per frame           : {total_kb/len(all_results):.1f} KB")
+# print(f"\nMaps saved to: {MAP_DIR}")
