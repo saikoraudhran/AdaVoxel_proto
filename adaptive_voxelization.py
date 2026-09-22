@@ -1300,6 +1300,1132 @@ print(f"\n  Map storage (10 frames) : {total_kb:.1f} KB = {total_kb/1024:.2f} MB
 print(f"  Avg per frame           : {total_kb/len(all_results):.1f} KB")
 print(f"\nMaps saved to: {MAP_DIR}")
 
+# -*- coding: utf-8 -*-
+"""
+semantic_labels.py
+──────────────────
+Stage 3 of the adaptive voxelization pipeline.
+
+What this module does
+─────────────────────
+  Raw LiDAR + .label files
+        ↓
+  point-level semantic class  (SemanticKITTI uint32 format)
+        ↓
+  voxel-level majority class  (same inverse index from VoxelPipeline)
+        ↓
+  2D-cell majority class       (same flat index from project_level)
+        ↓
+  sparse cell dataset          (coords, features, labels) ready for CNN
+
+Outputs
+───────
+  *_labels.npz   — per-voxel and per-cell semantic labels + confidence
+  *_sparse.npz   — sparse (coords, features, label) per level
+  label_dataset_meta.json — summary across all frames
+
+Usage (Colab)
+─────────────
+  Run after adaptive_voxelization.py has populated:
+    /content/voxel_store/   (voxel .npz files)
+    /content/maps_2d/       (map .npz files)
+
+  Label files are expected at:
+    /content/semantic_kitti_sample/{frame_id}.label
+
+  To download them alongside the .bin files, add to the Kaggle loop:
+    filename = f"dataset/sequences/00/labels/{i:06d}.label"
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import os
+import json
+import time
+
+# ─────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────
+SAMPLE_DIR  = "/content/semantic_kitti_sample"
+SAVE_DIR    = "/content/voxel_store"
+MAP_DIR     = "/content/maps_2d"
+LABEL_DIR = "/content/label_store"
+SPARSE_DIR  = "/content/sparse_store"
+
+os.makedirs(LABEL_DIR,  exist_ok=True)
+os.makedirs(SPARSE_DIR, exist_ok=True)
+
+SIZE_MAP = np.array([0.05, 0.15, 0.50], dtype=np.float32)
+
+FILES = [f"/content/semantic_kitti_sample/{i:06d}.bin" for i in range(10)]
+
+# Feature channel map — must match adaptive_voxelization.py exactly
+CH = {
+    "height_max":   0,
+    "height_min":   1,
+    "height_range": 2,
+    "height_mean":  3,
+    "point_count":  4,
+    "voxel_count":  5,
+    "intensity":    6,
+    "is_occupied":  7,
+    "pts_per_m2":   8,
+}
+N_CHANNELS = len(CH)
+
+
+# ─────────────────────────────────────────────────────────────────
+# SEMANTICKITTI CLASS DEFINITIONS
+# ─────────────────────────────────────────────────────────────────
+# Raw label IDs from the dataset.  SemanticKITTI uses the lower 16
+# bits of the uint32; upper 16 bits are the instance ID.
+# We remap to a compact set of 20 learning classes (0–19).
+# Class 0 is "unlabeled / ignore".
+
+RAW_TO_LEARNING = {
+    0:   0,   # unlabeled
+    1:   0,   # outlier → ignore
+    10:  1,   # car
+    11:  2,   # bicycle
+    13:  5,   # bus
+    15:  3,   # motorcycle
+    16:  5,   # on-rails → bus
+    18:  4,   # truck
+    20:  5,   # other-vehicle
+    30:  6,   # person
+    31:  7,   # bicyclist
+    32:  8,   # motorcyclist
+    40:  9,   # road
+    44: 10,   # parking
+    48: 11,   # sidewalk
+    49: 12,   # other-ground
+    50: 13,   # building
+    51: 14,   # fence
+    52:  0,   # other-structure → ignore
+    60:  9,   # lane-marking → road
+    70: 15,   # vegetation
+    71: 16,   # trunk
+    72: 17,   # terrain
+    80: 18,   # pole
+    81: 19,   # traffic-sign
+    99:  0,   # other-object → ignore
+    252:  1,  # moving-car
+    253:  7,  # moving-bicyclist
+    254:  6,  # moving-person
+    255:  8,  # moving-motorcyclist
+    256:  5,  # moving-on-rails
+    257:  5,  # moving-bus
+    258:  4,  # moving-truck
+    259:  5,  # moving-other-vehicle
+}
+
+CLASS_NAMES = {
+     0: "unlabeled",
+     1: "car",
+     2: "bicycle",
+     3: "motorcycle",
+     4: "truck",
+     5: "other-vehicle",
+     6: "person",
+     7: "bicyclist",
+     8: "motorcyclist",
+     9: "road",
+    10: "parking",
+    11: "sidewalk",
+    12: "other-ground",
+    13: "building",
+    14: "fence",
+    15: "vegetation",
+    16: "trunk",
+    17: "terrain",
+    18: "pole",
+    19: "traffic-sign",
+}
+
+# Colour palette for visualisation (one RGB per learning class)
+CLASS_COLORS = np.array([
+    [0,   0,   0  ],   #  0 unlabeled    — black
+    [245, 150, 100],   #  1 car          — orange
+    [245, 230, 100],   #  2 bicycle      — yellow
+    [150, 60,  30 ],   #  3 motorcycle   — brown
+    [180, 30,  80 ],   #  4 truck        — dark red
+    [255, 0,   0  ],   #  5 other-veh    — red
+    [30,  30,  255],   #  6 person       — blue
+    [200, 40,  255],   #  7 bicyclist    — purple
+    [90,  30,  150],   #  8 motorcyclist — dark purple
+    [255, 0,   255],   #  9 road         — magenta
+    [255, 150, 255],   # 10 parking      — light magenta
+    [75,  0,   75 ],   # 11 sidewalk     — dark magenta
+    [75,  0,   175],   # 12 other-ground — indigo
+    [0,   200, 255],   # 13 building     — cyan
+    [50,  120, 255],   # 14 fence        — light blue
+    [0,   175, 0  ],   # 15 vegetation   — green
+    [0,   60,  135],   # 16 trunk        — dark blue-green
+    [80,  240, 150],   # 17 terrain      — light green
+    [150, 240, 255],   # 18 pole         — ice blue
+    [0,   0,   255],   # 19 traffic-sign — pure blue
+], dtype=np.uint8)
+
+N_CLASSES = len(CLASS_NAMES)  # 20
+
+
+# ─────────────────────────────────────────────────────────────────
+# I/O HELPERS
+# ─────────────────────────────────────────────────────────────────
+def load_points(path):
+    return np.fromfile(path, dtype=np.float32).reshape(-1, 4)
+
+
+def load_labels(bin_path):
+    """
+    Load .label file and remap raw SemanticKITTI IDs → learning classes 0–19.
+    Expects labels at: /content/semantic_kitti_sample/{frame_id}.label
+    """
+    fid        = os.path.basename(bin_path).replace(".bin", "")
+    label_path = os.path.join(SAMPLE_DIR, f"{fid}.label")
+
+    if not os.path.exists(label_path):
+        raise FileNotFoundError(f"Label file not found: {label_path}")
+
+    raw = np.fromfile(label_path, dtype=np.uint32)
+    sem = (raw & 0xFFFF).astype(np.int32)          # lower 16 bits = semantic ID
+
+    # Validate point/label count matches
+    n_points = len(np.fromfile(bin_path, dtype=np.float32)) // 4
+    if len(sem) != n_points:
+        raise ValueError(
+            f"Point/label mismatch for {fid}: "
+            f"{n_points} points vs {len(sem)} labels"
+        )
+
+    # Build LUT: raw semantic ID → learning class (0–19)
+    # IDs not in RAW_TO_LEARNING map to 0 (unlabeled/ignore)
+    lut = np.zeros(max(RAW_TO_LEARNING.keys()) + 1, dtype=np.uint8)
+    for raw_id, learn_id in RAW_TO_LEARNING.items():
+        lut[raw_id] = learn_id
+
+    clipped = np.clip(sem, 0, len(lut) - 1)
+    return lut[clipped]                             # (N,) uint8, values 0–19
+
+
+def load_voxels(frame_id, save_dir):
+    path = os.path.join(save_dir, f"{frame_id}_voxels.npz")
+    d    = np.load(path)
+    return {
+        "unique_keys":    d["keys"],
+        "levels":         d["levels"],
+        "vox_size":       d["vox_size"],
+        "center_x":       d["center_xyz"][:, 0],
+        "center_y":       d["center_xyz"][:, 1],
+        "center_z":       d["center_xyz"][:, 2],
+        "point_count":    d["point_count"],
+        "height_mean":    d["height_mean"],
+        "height_min":     d["height_min"],
+        "height_max":     d["height_max"],
+        "height_var":     d["height_var"],
+        "height_range":   d["height_range"],
+        "intensity_mean": d["intensity"],
+    }
+
+
+def load_maps(frame_id, map_dir):
+    path = os.path.join(map_dir, f"{frame_id}_map2d.npz")
+    d    = np.load(path)
+    # meta_hwoff shape: (3, 4) — [H, W, ix_min, iy_min] per level
+    meta_arr = d["meta_hwoff"]
+    grids = {0: d["L0_5cm"], 1: d["L1_15cm"], 2: d["L2_50cm"]}
+    metas = {}
+    for i, lv in enumerate([0, 1, 2]):
+        H, W, ix_min, iy_min = meta_arr[i]
+        vs = float(SIZE_MAP[lv])
+        metas[lv] = {
+            "H": int(H), "W": int(W),
+            "ix_min": int(ix_min), "iy_min": int(iy_min),
+            "vox_size": vs,
+            "x_range_m": (ix_min * vs, (ix_min + H) * vs),
+            "y_range_m": (iy_min * vs, (iy_min + W) * vs),
+        }
+    return grids, metas
+
+
+# ─────────────────────────────────────────────────────────────────
+# STEP 1 — POINT LABELS → VOXEL LABELS
+# ─────────────────────────────────────────────────────────────────
+def assign_voxel_labels(points, point_labels, features):
+    """
+    For each voxel, find the majority semantic class of its member points.
+
+    Strategy
+    ────────
+    VoxelPipeline already computed the (inverse) mapping that tells us
+    which voxel index each point belongs to.  We replicate the same
+    key construction here to recover that inverse array, then use
+    np.add.reduceat on one-hot class counts to get per-voxel histograms
+    in a single vectorised pass.
+
+    Returns
+    ───────
+    voxel_class      : (V,) uint8  — majority class per voxel
+    voxel_confidence : (V,) float32 — fraction of points that voted for it
+    voxel_class_hist : (V, N_CLASSES) uint16 — full vote histogram
+    """
+    N = len(points)
+    x = points[:, 0];  y = points[:, 1]
+
+    # ── replicate level/key assignment (same logic as VoxelPipeline) ──
+    dist     = np.sqrt(x * x + y * y)
+    levels   = np.where(dist < 10, np.int32(0),
+               np.where(dist < 30, np.int32(1),
+                                   np.int32(2)))
+    vox_size = SIZE_MAP[levels]
+
+    coords = np.floor(
+        points[:, :3] / vox_size[:, None]
+    ).astype(np.int32)
+
+    keys_c = np.ascontiguousarray(
+        np.stack([levels, coords[:, 0], coords[:, 1], coords[:, 2]], axis=1)
+    )
+    keys_v = keys_c.view(
+        np.dtype((np.void, keys_c.dtype.itemsize * 4))
+    ).ravel()
+
+    unique_void, inverse = np.unique(keys_v, return_inverse=True)
+    unique_keys_check    = unique_void.view(np.int32).reshape(-1, 4)
+    V = len(unique_keys_check)
+
+    # Sanity: ensure key order matches saved features
+    # (they will match because np.unique is deterministic on identical input)
+    saved_keys = features["unique_keys"]
+    if not np.array_equal(unique_keys_check, saved_keys):
+        raise RuntimeError(
+            "Voxel key mismatch between label assignment and saved features. "
+            "Ensure points and features come from the same frame."
+        )
+
+    # ── sort points by voxel index ────────────────────────────────
+    order      = np.argsort(inverse, kind="stable")
+    inv_sorted = inverse[order]
+    lbl_sorted = point_labels[order].astype(np.int32)
+
+    diff   = np.diff(inv_sorted)
+    splits = np.flatnonzero(diff) + 1
+    starts = np.r_[0, splits]          # (V,)
+
+    # ── per-voxel class histogram via one-hot reduceat ────────────
+    # Build a (N, N_CLASSES) one-hot matrix, then reduceat-sum each column.
+    # For N=125k and N_CLASSES=20 this is a 125k×20 float32 array (~10 MB).
+    one_hot = np.zeros((N, N_CLASSES), dtype=np.float32)
+    one_hot[np.arange(N), lbl_sorted] = 1.0
+
+    # reduceat each class column independently — V reductions of ~125k/V pts
+    hist = np.zeros((V, N_CLASSES), dtype=np.float32)
+    for c in range(N_CLASSES):
+        hist[:, c] = np.add.reduceat(one_hot[order, c], starts)
+
+    hist_int = hist.astype(np.uint16)                   # save as uint16
+
+    # ── majority vote ─────────────────────────────────────────────
+    voxel_class      = np.argmax(hist, axis=1).astype(np.uint8)
+    total_votes      = hist.sum(axis=1)                 # = point_count
+    voxel_confidence = (
+        hist[np.arange(V), voxel_class] / np.maximum(total_votes, 1)
+    ).astype(np.float32)
+
+    return voxel_class, voxel_confidence, hist_int
+
+
+# ─────────────────────────────────────────────────────────────────
+# STEP 2 — VOXEL LABELS → 2D CELL LABELS
+# ─────────────────────────────────────────────────────────────────
+def assign_cell_labels(features, voxel_class, voxel_confidence, metas):
+    """
+    Project voxel labels down to 2D cells per level.
+
+    Aggregation rule
+    ────────────────
+    When multiple voxels project into the same XY cell, the cell
+    label = class with the most total supporting points across those
+    voxels.  We approximate this with a point-count-weighted vote:
+    each voxel casts `point_count` votes for its class.
+
+    Returns
+    ───────
+    cell_labels : dict[level → (H, W) uint8]  — per-cell majority class
+    cell_conf   : dict[level → (H, W) float32] — confidence
+    """
+    levels_arr = features["levels"]
+    pcount_arr = features["point_count"].astype(np.float32)
+    cx_all     = features["center_x"]
+    cy_all     = features["center_y"]
+
+    cell_labels = {}
+    cell_conf   = {}
+
+    for lv in [0, 1, 2]:
+        meta  = metas[lv]
+        H, W  = meta["H"], meta["W"]
+        vs    = meta["vox_size"]
+        ix_min = meta["ix_min"]
+        iy_min = meta["iy_min"]
+
+        mask   = levels_arr == lv
+        if mask.sum() == 0:
+            cell_labels[lv] = np.zeros((H, W), dtype=np.uint8)
+            cell_conf[lv]   = np.zeros((H, W), dtype=np.float32)
+            continue
+
+        cx = cx_all[mask]
+        cy = cy_all[mask]
+        vc = voxel_class[mask]
+        pc = pcount_arr[mask]
+
+        ix_rel = (np.floor(cx / vs).astype(np.int32) - ix_min)
+        iy_rel = (np.floor(cy / vs).astype(np.int32) - iy_min)
+        flat   = (ix_rel * W + iy_rel).astype(np.int64)
+
+        # Sort by flat cell index
+        order    = np.argsort(flat, kind="stable")
+        flat_s   = flat[order]
+        vc_s     = vc[order]
+        pc_s     = pc[order]
+
+        diff   = np.diff(flat_s)
+        splits = np.flatnonzero(diff) + 1
+        starts = np.r_[0, splits]
+        unique_cells = flat_s[starts]
+        n_occ        = len(unique_cells)
+
+        # Weighted histogram per cell
+        n_local = len(flat_s)
+        one_hot = np.zeros((n_local, N_CLASSES), dtype=np.float32)
+        one_hot[np.arange(n_local), vc_s.astype(np.int32)] = pc_s
+
+        hist_occ = np.zeros((n_occ, N_CLASSES), dtype=np.float32)
+        for c in range(N_CLASSES):
+            hist_occ[:, c] = np.add.reduceat(one_hot[:, c], starts)
+
+        cls_occ  = np.argmax(hist_occ, axis=1).astype(np.uint8)
+        tot_occ  = hist_occ.sum(axis=1)
+        conf_occ = (
+            hist_occ[np.arange(n_occ), cls_occ.astype(np.int32)]
+            / np.maximum(tot_occ, 1)
+        ).astype(np.float32)
+
+        # Scatter into full grid
+        cls_grid  = np.zeros(H * W, dtype=np.uint8)
+        conf_grid = np.zeros(H * W, dtype=np.float32)
+        cls_grid[unique_cells]  = cls_occ
+        conf_grid[unique_cells] = conf_occ
+
+        cell_labels[lv] = cls_grid.reshape(H, W)
+        cell_conf[lv]   = conf_grid.reshape(H, W)
+
+    return cell_labels, cell_conf
+
+
+# ─────────────────────────────────────────────────────────────────
+# STEP 3 — BUILD SPARSE DATASET
+# ─────────────────────────────────────────────────────────────────
+def build_sparse_dataset(grids, metas, cell_labels, cell_conf,
+                         ignore_class=0):
+    """
+    Extract only occupied cells with a valid (non-ignored) label.
+
+    Returns
+    ───────
+    dataset : dict[level → {coords, features, labels, confidence}]
+
+      coords     : (M, 2) int32   — (ix_rel, iy_rel) cell indices
+      features   : (M, N_CHANNELS) float32
+      labels     : (M,) uint8
+      confidence : (M,) float32
+    """
+    dataset = {}
+
+    for lv in [0, 1, 2]:
+        grid   = grids[lv]                            # (H, W, C)
+        labels = cell_labels[lv]                      # (H, W)
+        conf   = cell_conf[lv]                        # (H, W)
+
+        occ  = grid[:, :, CH["is_occupied"]].astype(bool)
+        valid = occ & (labels != ignore_class)
+
+        if valid.sum() == 0:
+            dataset[lv] = None
+            continue
+
+        ix, iy = np.where(valid)
+        coords     = np.stack([ix, iy], axis=1).astype(np.int32)
+        feat       = grid[ix, iy, :]                  # (M, N_CHANNELS)
+        lbl        = labels[ix, iy]                   # (M,)
+        c          = conf[ix, iy]                     # (M,)
+
+        dataset[lv] = {
+            "coords":     coords,
+            "features":   feat,
+            "labels":     lbl,
+            "confidence": c,
+            "meta":       metas[lv],
+        }
+
+    return dataset
+
+
+# ─────────────────────────────────────────────────────────────────
+# SAVE / LOAD
+# ─────────────────────────────────────────────────────────────────
+def save_label_npz(frame_id, voxel_class, voxel_confidence,
+                   voxel_hist, cell_labels, cell_conf, label_dir):
+    path = os.path.join(label_dir, f"{frame_id}_labels.npz")
+    np.savez_compressed(
+        path,
+        voxel_class      = voxel_class,
+        voxel_confidence = voxel_confidence,
+        voxel_hist       = voxel_hist,
+        cell_cls_l0      = cell_labels[0],
+        cell_cls_l1      = cell_labels[1],
+        cell_cls_l2      = cell_labels[2],
+        cell_conf_l0     = cell_conf[0],
+        cell_conf_l1     = cell_conf[1],
+        cell_conf_l2     = cell_conf[2],
+    )
+    return path
+
+
+def save_sparse_npz(frame_id, dataset, sparse_dir):
+    """Save all three levels into a single .npz."""
+    arrays = {}
+    for lv, d in dataset.items():
+        if d is None:
+            continue
+        pfx = f"l{lv}_"
+        arrays[pfx + "coords"]     = d["coords"]
+        arrays[pfx + "features"]   = d["features"]
+        arrays[pfx + "labels"]     = d["labels"]
+        arrays[pfx + "confidence"] = d["confidence"]
+
+    path = os.path.join(sparse_dir, f"{frame_id}_sparse.npz")
+    np.savez_compressed(path, **arrays)
+    return path
+
+
+def load_sparse_npz(frame_id, sparse_dir):
+    path = os.path.join(sparse_dir, f"{frame_id}_sparse.npz")
+    d    = np.load(path)
+    out  = {}
+    for lv in [0, 1, 2]:
+        pfx = f"l{lv}_"
+        if pfx + "coords" not in d:
+            out[lv] = None
+            continue
+        out[lv] = {
+            "coords":     d[pfx + "coords"],
+            "features":   d[pfx + "features"],
+            "labels":     d[pfx + "labels"],
+            "confidence": d[pfx + "confidence"],
+        }
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────
+# QUALITY REPORT
+# ─────────────────────────────────────────────────────────────────
+def label_quality_report(voxel_class, voxel_confidence,
+                         cell_labels, cell_conf, grids):
+    print("\n" + "=" * 60)
+    print("LABEL QUALITY REPORT")
+    print("=" * 60)
+
+    # ── voxel-level ──────────────────────────────────────────────
+    V = len(voxel_class)
+    unlabeled_v = (voxel_class == 0).sum()
+    print(f"\n── Voxel labels ({V:,} voxels) ──")
+    print(f"  Unlabeled (class 0) : {unlabeled_v:,} "
+          f"({unlabeled_v/V*100:.1f}%)")
+    print(f"  Mean confidence     : {voxel_confidence.mean():.3f}")
+    print(f"  Low-conf (<0.5)     : {(voxel_confidence < 0.5).sum():,}")
+
+    print(f"\n  Class distribution (top 10 by voxel count):")
+    unique_cls, cls_cnt = np.unique(voxel_class, return_counts=True)
+    order = np.argsort(cls_cnt)[::-1]
+    for i in order[:10]:
+        c   = unique_cls[i]
+        cnt = cls_cnt[i]
+        print(f"    {CLASS_NAMES.get(c, f'cls{c}'):20s} : "
+              f"{cnt:7,}  ({cnt/V*100:5.1f}%)")
+
+    # ── cell-level ───────────────────────────────────────────────
+    level_names = {0: "L0 5cm", 1: "L1 15cm", 2: "L2 50cm"}
+    for lv in [0, 1, 2]:
+        grid = grids[lv]
+        occ  = grid[:, :, CH["is_occupied"]].astype(bool)
+        lbl  = cell_labels[lv]
+        conf = cell_conf[lv]
+
+        n_occ     = occ.sum()
+        valid_occ = occ & (lbl != 0)
+        n_valid   = valid_occ.sum()
+
+        print(f"\n── {level_names[lv]} cell labels ──")
+        print(f"  Occupied cells      : {n_occ:,}")
+        print(f"  Labeled (non-zero)  : {n_valid:,} "
+              f"({n_valid/max(n_occ,1)*100:.1f}%)")
+        if n_valid > 0:
+            print(f"  Mean confidence     : "
+                  f"{conf[valid_occ].mean():.3f}")
+
+        uc, cc = np.unique(lbl[occ], return_counts=True)
+        total  = cc.sum()
+        ord_   = np.argsort(cc)[::-1]
+        top    = min(5, len(uc))
+        parts  = [
+            f"{CLASS_NAMES.get(int(uc[i]), '?')}={cc[i]/total*100:.0f}%"
+            for i in ord_[:top]
+        ]
+        print(f"  Top classes         : {', '.join(parts)}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# VISUALISATION
+# ─────────────────────────────────────────────────────────────────
+def visualize_semantic_map(grids, metas, cell_labels, cell_conf,
+                           frame_id, label_dir):
+    """
+    6-panel figure:
+      Row 0: semantic label map  (L0, L1, L2)
+      Row 1: label confidence    (L0, L1, L2)
+    Unoccupied cells are shown in white.
+    """
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f"Semantic Labels — {frame_id}", fontsize=14)
+
+    level_titles = {
+        0: "L0 5cm (0–10m)",
+        1: "L1 15cm (10–30m)",
+        2: "L2 50cm (30–100m)",
+    }
+
+    # Build a normalised palette: CLASS_COLORS → [0,1] float
+    palette = CLASS_COLORS.astype(np.float32) / 255.0    # (20, 3)
+
+    for col, lv in enumerate([0, 1, 2]):
+        grid  = grids[lv]
+        meta  = metas[lv]
+        occ   = grid[:, :, CH["is_occupied"]].astype(bool)
+        lbl   = cell_labels[lv]   # (H, W) uint8
+        conf  = cell_conf[lv]     # (H, W) float32
+
+        # ── semantic colour image ─────────────────────────────
+        H, W  = lbl.shape
+        rgb   = palette[lbl.ravel()].reshape(H, W, 3)
+        # Unoccupied cells → white
+        rgb[~occ] = 1.0
+
+        ax = axes[0, col]
+        ax.imshow(rgb.transpose(1, 0, 2), origin="lower", aspect="equal")
+        occ_pct = occ.sum() / (H * W) * 100
+        ax.set_title(f"{level_titles[lv]}\n"
+                     f"Grid {H}×{W}  Occ {occ_pct:.1f}%")
+        ax.set_xlabel("X cells")
+        ax.set_ylabel("Y cells")
+
+        # ── confidence heat map ───────────────────────────────
+        conf_disp        = conf.copy()
+        conf_disp[~occ]  = np.nan
+
+        ax2 = axes[1, col]
+        im  = ax2.imshow(conf_disp.T, origin="lower",
+                         cmap="RdYlGn", vmin=0.0, vmax=1.0,
+                         aspect="equal")
+        plt.colorbar(im, ax=ax2, shrink=0.8, label="confidence")
+        ax2.set_title(f"Label Confidence — {level_titles[lv]}")
+        ax2.set_xlabel("X cells")
+        ax2.set_ylabel("Y cells")
+
+    # Legend for semantic colours
+    from matplotlib.patches import Patch
+    legend_items = [
+        Patch(color=palette[c], label=CLASS_NAMES[c])
+        for c in sorted(CLASS_NAMES.keys())
+        if c != 0
+    ]
+    axes[0, 2].legend(
+        handles=legend_items,
+        bbox_to_anchor=(1.05, 1), loc="upper left",
+        fontsize=6, ncol=1
+    )
+
+    plt.tight_layout()
+    path = os.path.join(label_dir, f"{frame_id}_semantic.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"  Saved semantic map → {path}")
+
+
+def visualize_sparse_dataset(dataset, frame_id, sparse_dir):
+    """
+    Top-down scatter plot of the sparse cell dataset.
+    Each point is coloured by its semantic class.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle(f"Sparse Cell Dataset — {frame_id}", fontsize=13)
+
+    level_names = {0: "L0 5cm", 1: "L1 15cm", 2: "L2 50cm"}
+    palette     = CLASS_COLORS.astype(np.float32) / 255.0
+
+    for col, lv in enumerate([0, 1, 2]):
+        ax = axes[col]
+        d  = dataset[lv]
+
+        if d is None:
+            ax.set_title(f"{level_names[lv]}\n(no data)")
+            continue
+
+        coords  = d["coords"]          # (M, 2)
+        labels  = d["labels"]          # (M,)
+        meta    = d["meta"]
+        vs      = meta["vox_size"]
+
+        # Physical coordinates
+        px = (coords[:, 0] + 0.5) * vs + meta["ix_min"] * vs
+        py = (coords[:, 1] + 0.5) * vs + meta["iy_min"] * vs
+
+        colors = palette[labels]       # (M, 3)
+        ax.scatter(px, py, c=colors, s=1.5, linewidths=0)
+        ax.set_aspect("equal")
+        ax.set_title(f"{level_names[lv]}\n{len(coords):,} labeled cells")
+        ax.set_xlabel("X (m)")
+        ax.set_ylabel("Y (m)")
+
+    plt.tight_layout()
+    path = os.path.join(sparse_dir, f"{frame_id}_sparse_viz.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"  Saved sparse viz → {path}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# DATASET SUMMARY
+# ─────────────────────────────────────────────────────────────────
+def sparse_dataset_summary(all_meta):
+    """Print a cross-frame summary and return a per-class cell count dict."""
+    print("\n" + "=" * 80)
+    print("SPARSE DATASET SUMMARY")
+    print("=" * 80)
+
+    frames = len(all_meta)
+    print(f"  Frames processed : {frames}")
+
+    # Aggregate per-level cell counts and total labeled cells
+    level_totals = {0: 0, 1: 0, 2: 0}
+    class_totals = np.zeros(N_CLASSES, dtype=np.int64)
+
+    for m in all_meta:
+        for lv in [0, 1, 2]:
+            level_totals[lv] += m[f"l{lv}_labeled_cells"]
+        for c, cnt in m["class_counts"].items():
+            class_totals[int(c)] += cnt
+
+    total_cells = sum(level_totals.values())
+    print(f"\n  Total labeled cells : {total_cells:,}")
+    print(f"    L0 5cm            : {level_totals[0]:,}")
+    print(f"    L1 15cm           : {level_totals[1]:,}")
+    print(f"    L2 50cm           : {level_totals[2]:,}")
+
+    print(f"\n  Class distribution across all frames:")
+    order = np.argsort(class_totals)[::-1]
+    for c in order:
+        if class_totals[c] == 0:
+            continue
+        print(f"    {CLASS_NAMES.get(c, f'cls{c}'):20s} : "
+              f"{class_totals[c]:8,}  ({class_totals[c]/total_cells*100:5.1f}%)")
+
+    return class_totals
+
+
+# ─────────────────────────────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────────────────────────────
+print("=" * 80)
+print("SEMANTIC LABEL PIPELINE")
+print("=" * 80)
+print(f"{'Frame':<12} {'Voxels':>8} {'Cells L0':>10} "
+      f"{'Cells L1':>10} {'Cells L2':>10} {'ms':>8} {'FPS':>6}")
+print("-" * 80)
+
+all_meta  = []
+all_times = []
+
+# Warmup: first frame doubles as warmup (not excluded from timing here —
+# label loading is the bottleneck, not NumPy JIT).
+
+for fpath in FILES:
+    fname = os.path.basename(fpath)
+    fid   = os.path.splitext(fname)[0]
+
+    t0 = time.perf_counter()
+
+    # ── load ───────────────────────────────────────────────────
+    points        = load_points(fpath)
+    point_labels  = load_labels(fpath)      # (N,) uint8
+    features      = load_voxels(fid, SAVE_DIR)
+    grids, metas  = load_maps(fid, MAP_DIR)
+
+    # ── step 1: voxel labels ───────────────────────────────────
+    voxel_class, voxel_conf, voxel_hist = assign_voxel_labels(
+        points, point_labels, features
+    )
+
+    # ── step 2: cell labels ────────────────────────────────────
+    cell_labels, cell_conf = assign_cell_labels(
+        features, voxel_class, voxel_conf, metas
+    )
+
+    # ── step 3: sparse dataset ─────────────────────────────────
+    dataset = build_sparse_dataset(grids, metas, cell_labels, cell_conf)
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    all_times.append(elapsed_ms)
+
+    # ── save ───────────────────────────────────────────────────
+    save_label_npz(fid, voxel_class, voxel_conf, voxel_hist,
+                   cell_labels, cell_conf, LABEL_DIR)
+    save_sparse_npz(fid, dataset, SPARSE_DIR)
+
+    # ── per-frame class counts for summary ────────────────────
+    class_counts = {}
+    for lv in [0, 1, 2]:
+        d = dataset[lv]
+        if d is not None:
+            uc, cc = np.unique(d["labels"], return_counts=True)
+            for c, cnt in zip(uc, cc):
+                class_counts[str(c)] = class_counts.get(str(c), 0) + int(cnt)
+
+    meta_entry = {
+        "frame":           fid,
+        "n_voxels":        int(len(voxel_class)),
+        "elapsed_ms":      float(elapsed_ms),
+        "l0_labeled_cells": int(len(dataset[0]["coords"]))
+                            if dataset[0] else 0,
+        "l1_labeled_cells": int(len(dataset[1]["coords"]))
+                            if dataset[1] else 0,
+        "l2_labeled_cells": int(len(dataset[2]["coords"]))
+                            if dataset[2] else 0,
+        "class_counts":    class_counts,
+    }
+    all_meta.append(meta_entry)
+
+    l0c = meta_entry["l0_labeled_cells"]
+    l1c = meta_entry["l1_labeled_cells"]
+    l2c = meta_entry["l2_labeled_cells"]
+    print(f"{fname:<12} {meta_entry['n_voxels']:>8,} "
+          f"{l0c:>10,} {l1c:>10,} {l2c:>10,} "
+          f"{elapsed_ms:>7.1f}ms "
+          f"{1000/elapsed_ms:>5.1f}")
+
+# ── quality report + visualisation on frame 000000 ───────────────
+print("\nRunning quality report and visualization on 000000...")
+points_0      = load_points(FILES[0])
+labels_0      = load_labels(FILES[0])
+features_0    = load_voxels("000000", SAVE_DIR)
+grids_0, metas_0 = load_maps("000000", MAP_DIR)
+
+vcls_0, vconf_0, vhist_0 = assign_voxel_labels(
+    points_0, labels_0, features_0
+)
+clbl_0, cconf_0 = assign_cell_labels(
+    features_0, vcls_0, vconf_0, metas_0
+)
+ds_0 = build_sparse_dataset(grids_0, metas_0, clbl_0, cconf_0)
+
+label_quality_report(vcls_0, vconf_0, clbl_0, cconf_0, grids_0)
+visualize_semantic_map(grids_0, metas_0, clbl_0, cconf_0,
+                       "000000", LABEL_DIR)
+visualize_sparse_dataset(ds_0, "000000", SPARSE_DIR)
+
+# ── cross-frame summary ──────────────────────────────────────────
+class_totals = sparse_dataset_summary(all_meta)
+
+avg_ms    = np.mean(all_times)
+total_kb  = sum(
+    os.path.getsize(os.path.join(SPARSE_DIR, f"{m['frame']}_sparse.npz"))
+    / 1024
+    for m in all_meta
+)
+
+print(f"\n── Timing ──")
+print(f"  Avg label pipeline   : {avg_ms:.1f} ms  ({1000/avg_ms:.1f} FPS)")
+print(f"  (Labels are an offline step; this does not affect inference FPS)")
+
+print(f"\n── Storage ──")
+print(f"  Sparse store (10 frames) : {total_kb:.1f} KB = {total_kb/1024:.2f} MB")
+print(f"  Avg per frame            : {total_kb/len(all_meta):.1f} KB")
+
+# ── save dataset metadata ────────────────────────────────────────
+meta_out = {
+    "frames":       all_meta,
+    "n_classes":    N_CLASSES,
+    "class_names":  CLASS_NAMES,
+    "ch_map":       CH,
+    "size_map":     SIZE_MAP.tolist(),
+    "ignore_class": 0,
+}
+meta_path = os.path.join(SPARSE_DIR, "dataset_meta.json")
+with open(meta_path, "w") as f:
+    json.dump(meta_out, f, indent=2)
+print(f"\n  Dataset metadata → {meta_path}")
+print(f"\nFiles saved to:")
+print(f"  Labels  : {LABEL_DIR}")
+print(f"  Sparse  : {SPARSE_DIR}")
+print(f"\nTo reload a frame's sparse data:")
+print('  ds = load_sparse_npz("000000", SPARSE_DIR)')
+print('  # ds[0]["coords"], ds[0]["features"], ds[0]["labels"]')
+
+# -*- coding: utf-8 -*-
+"""
+visualize_labels.py
+───────────────────
+Visual label alignment check for frame 000000.
+
+Produces four plots saved to /content/label_store/:
+
+  1. Top-down (XY) — all points coloured by semantic class
+  2. Side view (XZ) — height profile coloured by class
+  3. Front view (YZ) — lateral slice coloured by class
+  4. Per-class point-cloud strips — one row per class, top-down,
+     so you can inspect each class in isolation
+
+If the labels are correctly aligned you will see:
+  - Road points forming a flat band at the bottom of the scene
+  - Buildings forming vertical walls
+  - Cars appearing as compact blobs at road level
+  - Vegetation distributed above ground level
+  - Sidewalks flanking the road
+"""
+
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import os
+
+# ── CONFIG ───────────────────────────────────────────────────────
+SAMPLE_DIR = "/content/semantic_kitti_sample"
+LABEL_DIR  = "/content/semantic_kitti_sample"
+OUT_DIR    = "/content/label_store"
+FRAME_ID   = "000000"
+
+os.makedirs(OUT_DIR, exist_ok=True)
+
+RAW_TO_LEARNING = {
+    0:0, 1:0, 10:1, 11:2, 13:5, 15:3, 16:5, 18:4, 20:5,
+    30:6, 31:7, 32:8, 40:9, 44:10, 48:11, 49:12, 50:13,
+    51:14, 52:0, 60:9, 70:15, 71:16, 72:17, 80:18, 81:19,
+    99:0, 252:1, 253:7, 254:6, 255:8, 256:5, 257:5, 258:4, 259:5,
+}
+CLASS_NAMES = {
+    0:"unlabeled", 1:"car", 2:"bicycle", 3:"motorcycle", 4:"truck",
+    5:"other-vehicle", 6:"person", 7:"bicyclist", 8:"motorcyclist",
+    9:"road", 10:"parking", 11:"sidewalk", 12:"other-ground",
+    13:"building", 14:"fence", 15:"vegetation", 16:"trunk",
+    17:"terrain", 18:"pole", 19:"traffic-sign",
+}
+CLASS_COLORS = np.array([
+    [0,   0,   0  ],  #  0 unlabeled
+    [245, 150, 100],  #  1 car
+    [245, 230, 100],  #  2 bicycle
+    [150, 60,  30 ],  #  3 motorcycle
+    [180, 30,  80 ],  #  4 truck
+    [255, 0,   0  ],  #  5 other-vehicle
+    [30,  30,  255],  #  6 person
+    [200, 40,  255],  #  7 bicyclist
+    [90,  30,  150],  #  8 motorcyclist
+    [255, 0,   255],  #  9 road
+    [255, 150, 255],  # 10 parking
+    [75,  0,   75 ],  # 11 sidewalk
+    [75,  0,   175],  # 12 other-ground
+    [0,   200, 255],  # 13 building
+    [50,  120, 255],  # 14 fence
+    [0,   175, 0  ],  # 15 vegetation
+    [0,   60,  135],  # 16 trunk
+    [80,  240, 150],  # 17 terrain
+    [150, 240, 255],  # 18 pole
+    [0,   0,   255],  # 19 traffic-sign
+], dtype=np.uint8)
+
+# Classes worth showing in the per-class strip plot
+# (skip very rare ones that have near-zero points in frame 000000)
+CLASSES_TO_SHOW = [9, 11, 13, 15, 1, 17, 14, 16, 18, 10]
+
+
+def build_lut():
+    lut = np.zeros(max(RAW_TO_LEARNING.keys()) + 1, dtype=np.uint8)
+    for raw_id, learn_id in RAW_TO_LEARNING.items():
+        lut[raw_id] = learn_id
+    return lut
+
+LUT = build_lut()
+
+
+# ── LOAD ─────────────────────────────────────────────────────────
+bin_path   = os.path.join(SAMPLE_DIR, f"{FRAME_ID}.bin")
+label_path = os.path.join(LABEL_DIR,  f"{FRAME_ID}.label")
+
+pts  = np.fromfile(bin_path,   dtype=np.float32).reshape(-1, 4)
+raw  = np.fromfile(label_path, dtype=np.uint32)
+sem  = (raw & 0xFFFF).astype(np.int32)
+lbls = LUT[np.clip(sem, 0, len(LUT) - 1)]   # (N,) uint8
+
+x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+
+# Normalised colours per point
+colors = CLASS_COLORS[lbls].astype(np.float32) / 255.0  # (N, 3)
+
+# Downsample for scatter plots (matplotlib struggles with 125k points)
+rng      = np.random.default_rng(0)
+max_pts  = 40_000
+if len(pts) > max_pts:
+    idx    = rng.choice(len(pts), size=max_pts, replace=False)
+    xs, ys, zs = x[idx], y[idx], z[idx]
+    cs         = colors[idx]
+    ls         = lbls[idx]
+else:
+    xs, ys, zs, cs, ls = x, y, z, colors, lbls
+
+print(f"Loaded {len(pts):,} points → plotting {len(xs):,} (downsampled)")
+
+
+# ── PLOT 1 — three orthographic views ────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(21, 7))
+fig.suptitle(f"Frame {FRAME_ID} — Semantic Labels (3 views)", fontsize=13)
+
+# Top-down XY
+ax = axes[0]
+ax.scatter(xs, ys, c=cs, s=0.3, linewidths=0)
+ax.set_title("Top-down (XY)")
+ax.set_xlabel("X (m)  →  forward")
+ax.set_ylabel("Y (m)  →  left")
+ax.set_aspect("equal")
+
+# Side view XZ  (forward / height)
+ax = axes[1]
+ax.scatter(xs, zs, c=cs, s=0.3, linewidths=0)
+ax.set_title("Side view (XZ)")
+ax.set_xlabel("X (m)  →  forward")
+ax.set_ylabel("Z (m)  →  up")
+
+# Front view YZ  (lateral / height)
+ax = axes[2]
+ax.scatter(ys, zs, c=cs, s=0.3, linewidths=0)
+ax.set_title("Front view (YZ)")
+ax.set_xlabel("Y (m)  →  left")
+ax.set_ylabel("Z (m)  →  up")
+
+# Shared legend (classes present in this frame)
+present = np.unique(ls)
+patches = [
+    mpatches.Patch(
+        color=CLASS_COLORS[c].astype(np.float32) / 255.0,
+        label=CLASS_NAMES.get(c, f"cls{c}")
+    )
+    for c in present if c != 0
+]
+fig.legend(handles=patches, loc="lower center", ncol=7,
+           fontsize=7, bbox_to_anchor=(0.5, -0.04))
+
+plt.tight_layout()
+p = os.path.join(OUT_DIR, f"{FRAME_ID}_views.png")
+plt.savefig(p, dpi=150, bbox_inches="tight")
+plt.show()
+print(f"Saved → {p}")
+
+
+# ── PLOT 2 — per-class top-down strips ───────────────────────────
+# One row per class; shows only that class's points so you can
+# inspect spatial structure without other classes occluding it.
+n_show = len(CLASSES_TO_SHOW)
+fig, axes = plt.subplots(2, 5, figsize=(20, 9))
+fig.suptitle(f"Frame {FRAME_ID} — Per-class top-down view", fontsize=13)
+axes = axes.ravel()
+
+for i, cls_id in enumerate(CLASSES_TO_SHOW):
+    ax   = axes[i]
+    mask = ls == cls_id
+    name = CLASS_NAMES.get(cls_id, f"cls{cls_id}")
+    col  = CLASS_COLORS[cls_id].astype(np.float32) / 255.0
+
+    if mask.sum() == 0:
+        ax.set_title(f"{name}\n(no points)")
+        ax.axis("off")
+        continue
+
+    ax.scatter(xs[mask], ys[mask], c=[col], s=0.5, linewidths=0)
+    ax.set_title(f"{name}  n={mask.sum():,}", fontsize=9)
+    ax.set_xlabel("X (m)", fontsize=7)
+    ax.set_ylabel("Y (m)", fontsize=7)
+    ax.set_aspect("equal")
+    ax.tick_params(labelsize=6)
+
+plt.tight_layout()
+p = os.path.join(OUT_DIR, f"{FRAME_ID}_per_class.png")
+plt.savefig(p, dpi=150, bbox_inches="tight")
+plt.show()
+print(f"Saved → {p}")
+
+
+# ── PLOT 3 — Z distribution per class (box plot) ─────────────────
+# Sanity check: are Z ranges per class physically plausible?
+present_cls = [c for c in range(20)
+               if c != 0 and (lbls == c).sum() >= 10]
+
+z_data  = [z[lbls == c] for c in present_cls]
+z_names = [CLASS_NAMES.get(c, f"cls{c}") for c in present_cls]
+
+fig, ax = plt.subplots(figsize=(14, 5))
+bp = ax.boxplot(z_data, patch_artist=True, showfliers=False,
+                medianprops=dict(color="black", linewidth=1.5))
+
+for patch, cls_id in zip(bp["boxes"], present_cls):
+    patch.set_facecolor(
+        CLASS_COLORS[cls_id].astype(np.float32) / 255.0
+    )
+
+ax.set_xticks(range(1, len(z_names) + 1))
+ax.set_xticklabels(z_names, rotation=40, ha="right", fontsize=8)
+ax.set_ylabel("Z (m)")
+ax.set_title(f"Frame {FRAME_ID} — Z distribution per class "
+             f"(box = IQR, whiskers = 5–95th pct)")
+ax.axhline(y=0, color="grey", linewidth=0.5, linestyle="--",
+           label="Z=0 (sensor level)")
+ax.legend(fontsize=8)
+plt.tight_layout()
+p = os.path.join(OUT_DIR, f"{FRAME_ID}_z_distribution.png")
+plt.savefig(p, dpi=150, bbox_inches="tight")
+plt.show()
+print(f"Saved → {p}")
+
+
+# ── QUICK TEXT SUMMARY ───────────────────────────────────────────
+print("\n── Z statistics per class ──")
+print(f"  {'Class':<18} {'n':>7}  {'Z min':>7}  {'Z mean':>7}  "
+      f"{'Z max':>7}  {'Z range':>8}")
+print("  " + "-" * 62)
+for c in range(20):
+    mask = lbls == c
+    if mask.sum() < 5:
+        continue
+    zc = z[mask]
+    print(f"  {CLASS_NAMES.get(c,'?'):<18} {mask.sum():>7,}  "
+          f"{zc.min():>7.2f}  {zc.mean():>7.2f}  "
+          f"{zc.max():>7.2f}  {zc.max()-zc.min():>8.2f}")
+
+print(f"\nAll plots saved to {OUT_DIR}/")
+print("Open the images and check:")
+print("  views.png    — road=flat band, buildings=vertical, cars=blobs")
+print("  per_class.png — each class forms spatially coherent regions")
+print("  z_dist.png   — road/terrain Z < sidewalk Z < car Z < building Z")
+
 # import numpy as np
 # import matplotlib.pyplot as plt
 # import os
@@ -2370,3 +3496,26 @@ print(f"\nMaps saved to: {MAP_DIR}")
 #       f"= {total_kb/1024:.2f} MB")
 # print(f"  Avg per frame           : {total_kb/len(all_results):.1f} KB")
 # print(f"\nMaps saved to: {MAP_DIR}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

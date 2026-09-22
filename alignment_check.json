@@ -1,0 +1,559 @@
+{
+  "overall_pass": false,
+  "check_1_counts": {
+    "000000": {
+      "n_points": 124668,
+      "n_labels": 124668,
+      "passed": true
+    },
+    "000001": {
+      "n_points": 124605,
+      "n_labels": 124605,
+      "passed": true
+    },
+    "000002": {
+      "n_points": 124478,
+      "n_labels": 124478,
+      "passed": true
+    },
+    "000003": {
+      "n_points": 124167,
+      "n_labels": 124167,
+      "passed": true
+    },
+    "000004": {
+      "n_points": 123969,
+      "n_labels": 123969,
+      "passed": true
+    },
+    "000005": {
+      "n_points": 123924,
+      "n_labels": 123924,
+      "passed": true
+    },
+    "000006": {
+      "n_points": 123373,
+      "n_labels": 123373,
+      "passed": true
+    },
+    "000007": {
+      "n_points": 122765,
+      "n_labels": 122765,
+      "passed": true
+    },
+    "000008": {
+      "n_points": 122123,
+      "n_labels": 122123,
+      "passed": true
+    },
+    "000009": {
+      "n_points": 121357,
+      "n_labels": 121357,
+      "passed": true
+    }
+  },
+  "check_2_geometry": {
+    "000000": {
+      "passed": false,
+      "classes": {
+        "road": {
+          "skipped": false,
+          "n": 35281,
+          "passed": true,
+          "detail": "Z mean=-1.85 range=1.237"
+        },
+        "building": {
+          "skipped": false,
+          "n": 18268,
+          "passed": true,
+          "detail": "Z range=3.57 m"
+        },
+        "vegetation": {
+          "skipped": false,
+          "n": 27123,
+          "passed": true,
+          "detail": "Z range=4.18 max=1.67"
+        },
+        "car": {
+          "skipped": false,
+          "n": 4234,
+          "passed": false,
+          "detail": "2/4 clusters failed: cluster(n=380) Z=-0.98 XY=19.56; cluster(n=1014) Z=-1.50 XY=15.40"
+        },
+        "person": {
+          "skipped": true,
+          "n": 0
+        },
+        "sidewalk": {
+          "skipped": false,
+          "n": 26360,
+          "passed": true,
+          "detail": "Z mean=-1.72 range=1.297"
+        },
+        "terrain": {
+          "skipped": false,
+          "n": 2964,
+          "passed": true,
+          "detail": "Z mean=-1.84 range=1.515"
+        }
+      }
+    },
+    "000001": {
+      "passed": false,
+      "classes": {
+        "road": {
+          "skipped": false,
+          "n": 34101,
+          "passed": true,
+          "detail": "Z mean=-1.86 range=1.579"
+        },
+        "building": {
+          "skipped": false,
+          "n": 19180,
+          "passed": true,
+          "detail": "Z range=3.52 m"
+        },
+        "vegetation": {
+          "skipped": false,
+          "n": 27116,
+          "passed": true,
+          "detail": "Z range=4.15 max=1.72"
+        },
+        "car": {
+          "skipped": false,
+          "n": 4387,
+          "passed": false,
+          "detail": "2/4 clusters failed: cluster(n=438) Z=-1.03 XY=19.58; cluster(n=1006) Z=-1.53 XY=15.47"
+        },
+        "person": {
+          "skipped": true,
+          "n": 0
+        },
+        "sidewalk": {
+          "skipped": false,
+          "n": 26040,
+          "passed": true,
+          "detail": "Z mean=-1.72 range=1.339"
+        },
+        "terrain": {
+          "skipped": false,
+          "n": 2765,
+          "passed": true,
+          "detail": "Z mean=-1.86 range=1.666"
+        }
+      }
+    },
+    "000002": {
+      "passed": false,
+      "classes": {
+        "road": {
+          "skipped": false,
+          "n": 32892,
+          "passed": true,
+          "detail": "Z mean=-1.85 range=1.444"
+        },
+        "building": {
+          "skipped": false,
+          "n": 20123,
+          "passed": true,
+          "detail": "Z range=3.46 m"
+        },
+        "vegetation": {
+          "skipped": false,
+          "n": 26987,
+          "passed": true,
+          "detail": "Z range=4.07 max=1.62"
+        },
+        "car": {
+          "skipped": false,
+          "n": 4725,
+          "passed": false,
+          "detail": "2/5 clusters failed: cluster(n=389) Z=-1.13 XY=15.49; cluster(n=1009) Z=-1.51 XY=15.87"
+        },
+        "person": {
+          "skipped": true,
+          "n": 0
+        },
+        "sidewalk": {
+          "skipped": false,
+          "n": 25524,
+          "passed": true,
+          "detail": "Z mean=-1.74 range=1.420"
+        },
+        "terrain": {
+          "skipped": false,
+          "n": 2585,
+          "passed": true,
+          "detail": "Z mean=-1.81 range=1.659"
+        }
+      }
+    },
+    "000003": {
+      "passed": false,
+      "classes": {
+        "road": {
+          "skipped": false,
+          "n": 31862,
+          "passed": true,
+          "detail": "Z mean=-1.83 range=1.365"
+        },
+        "building": {
+          "skipped": false,
+          "n": 20955,
+          "passed": true,
+          "detail": "Z range=3.10 m"
+        },
+        "vegetation": {
+          "skipped": false,
+          "n": 26815,
+          "passed": true,
+          "detail": "Z range=4.20 max=1.77"
+        },
+        "car": {
+          "skipped": false,
+          "n": 5061,
+          "passed": false,
+          "detail": "2/5 clusters failed: cluster(n=404) Z=-1.20 XY=15.90; cluster(n=977) Z=-1.47 XY=15.63"
+        },
+        "person": {
+          "skipped": true,
+          "n": 0
+        },
+        "sidewalk": {
+          "skipped": false,
+          "n": 24677,
+          "passed": true,
+          "detail": "Z mean=-1.71 range=1.684"
+        },
+        "terrain": {
+          "skipped": false,
+          "n": 2387,
+          "passed": true,
+          "detail": "Z mean=-1.78 range=1.495"
+        }
+      }
+    },
+    "000004": {
+      "passed": false,
+      "classes": {
+        "road": {
+          "skipped": false,
+          "n": 30920,
+          "passed": true,
+          "detail": "Z mean=-1.82 range=1.336"
+        },
+        "building": {
+          "skipped": false,
+          "n": 21848,
+          "passed": true,
+          "detail": "Z range=3.36 m"
+        },
+        "vegetation": {
+          "skipped": false,
+          "n": 26039,
+          "passed": true,
+          "detail": "Z range=4.15 max=1.64"
+        },
+        "car": {
+          "skipped": false,
+          "n": 5510,
+          "passed": false,
+          "detail": "2/5 clusters failed: cluster(n=439) Z=-1.20 XY=15.92; cluster(n=959) Z=-1.46 XY=16.28"
+        },
+        "person": {
+          "skipped": true,
+          "n": 0
+        },
+        "sidewalk": {
+          "skipped": false,
+          "n": 24305,
+          "passed": true,
+          "detail": "Z mean=-1.71 range=1.255"
+        },
+        "terrain": {
+          "skipped": false,
+          "n": 2198,
+          "passed": true,
+          "detail": "Z mean=-1.76 range=1.581"
+        }
+      }
+    },
+    "000005": {
+      "passed": false,
+      "classes": {
+        "road": {
+          "skipped": false,
+          "n": 29947,
+          "passed": true,
+          "detail": "Z mean=-1.84 range=1.388"
+        },
+        "building": {
+          "skipped": false,
+          "n": 22735,
+          "passed": true,
+          "detail": "Z range=3.40 m"
+        },
+        "vegetation": {
+          "skipped": false,
+          "n": 25189,
+          "passed": true,
+          "detail": "Z range=3.79 max=1.53"
+        },
+        "car": {
+          "skipped": false,
+          "n": 6302,
+          "passed": false,
+          "detail": "2/5 clusters failed: cluster(n=503) Z=-1.19 XY=15.99; cluster(n=939) Z=-1.47 XY=16.43"
+        },
+        "person": {
+          "skipped": true,
+          "n": 0
+        },
+        "sidewalk": {
+          "skipped": false,
+          "n": 23964,
+          "passed": true,
+          "detail": "Z mean=-1.72 range=1.244"
+        },
+        "terrain": {
+          "skipped": false,
+          "n": 2060,
+          "passed": true,
+          "detail": "Z mean=-1.75 range=1.558"
+        }
+      }
+    },
+    "000006": {
+      "passed": false,
+      "classes": {
+        "road": {
+          "skipped": false,
+          "n": 29168,
+          "passed": true,
+          "detail": "Z mean=-1.83 range=1.295"
+        },
+        "building": {
+          "skipped": false,
+          "n": 23885,
+          "passed": true,
+          "detail": "Z range=3.61 m"
+        },
+        "vegetation": {
+          "skipped": false,
+          "n": 24591,
+          "passed": true,
+          "detail": "Z range=3.76 max=1.44"
+        },
+        "car": {
+          "skipped": false,
+          "n": 6871,
+          "passed": false,
+          "detail": "2/5 clusters failed: cluster(n=503) Z=-1.23 XY=15.29; cluster(n=909) Z=-1.46 XY=15.26"
+        },
+        "person": {
+          "skipped": false,
+          "n": 5,
+          "passed": true,
+          "detail": "Z mean=-1.59 XY span=0.33"
+        },
+        "sidewalk": {
+          "skipped": false,
+          "n": 22949,
+          "passed": true,
+          "detail": "Z mean=-1.72 range=1.267"
+        },
+        "terrain": {
+          "skipped": false,
+          "n": 1889,
+          "passed": true,
+          "detail": "Z mean=-1.73 range=1.562"
+        }
+      }
+    },
+    "000007": {
+      "passed": false,
+      "classes": {
+        "road": {
+          "skipped": false,
+          "n": 28676,
+          "passed": true,
+          "detail": "Z mean=-1.82 range=1.244"
+        },
+        "building": {
+          "skipped": false,
+          "n": 25007,
+          "passed": true,
+          "detail": "Z range=3.50 m"
+        },
+        "vegetation": {
+          "skipped": false,
+          "n": 24252,
+          "passed": true,
+          "detail": "Z range=4.19 max=1.80"
+        },
+        "car": {
+          "skipped": false,
+          "n": 7561,
+          "passed": false,
+          "detail": "2/5 clusters failed: cluster(n=837) Z=-1.40 XY=15.98; cluster(n=539) Z=-1.22 XY=15.07"
+        },
+        "person": {
+          "skipped": true,
+          "n": 0
+        },
+        "sidewalk": {
+          "skipped": false,
+          "n": 21662,
+          "passed": true,
+          "detail": "Z mean=-1.73 range=1.148"
+        },
+        "terrain": {
+          "skipped": false,
+          "n": 1731,
+          "passed": true,
+          "detail": "Z mean=-1.69 range=1.422"
+        }
+      }
+    },
+    "000008": {
+      "passed": false,
+      "classes": {
+        "road": {
+          "skipped": false,
+          "n": 28363,
+          "passed": true,
+          "detail": "Z mean=-1.82 range=0.887"
+        },
+        "building": {
+          "skipped": false,
+          "n": 25678,
+          "passed": true,
+          "detail": "Z range=3.16 m"
+        },
+        "vegetation": {
+          "skipped": false,
+          "n": 24168,
+          "passed": true,
+          "detail": "Z range=3.55 max=1.53"
+        },
+        "car": {
+          "skipped": false,
+          "n": 7619,
+          "passed": false,
+          "detail": "2/5 clusters failed: cluster(n=864) Z=-1.39 XY=15.71; cluster(n=607) Z=-1.18 XY=15.45"
+        },
+        "person": {
+          "skipped": true,
+          "n": 1
+        },
+        "sidewalk": {
+          "skipped": false,
+          "n": 20301,
+          "passed": true,
+          "detail": "Z mean=-1.71 range=1.023"
+        },
+        "terrain": {
+          "skipped": false,
+          "n": 1529,
+          "passed": true,
+          "detail": "Z mean=-1.71 range=1.386"
+        }
+      }
+    },
+    "000009": {
+      "passed": false,
+      "classes": {
+        "road": {
+          "skipped": false,
+          "n": 27955,
+          "passed": true,
+          "detail": "Z mean=-1.83 range=1.002"
+        },
+        "building": {
+          "skipped": false,
+          "n": 26218,
+          "passed": true,
+          "detail": "Z range=3.82 m"
+        },
+        "vegetation": {
+          "skipped": false,
+          "n": 24379,
+          "passed": true,
+          "detail": "Z range=4.37 max=1.85"
+        },
+        "car": {
+          "skipped": false,
+          "n": 7429,
+          "passed": false,
+          "detail": "2/5 clusters failed: cluster(n=676) Z=-1.11 XY=15.84; cluster(n=790) Z=-1.49 XY=15.97"
+        },
+        "person": {
+          "skipped": true,
+          "n": 1
+        },
+        "sidewalk": {
+          "skipped": false,
+          "n": 18519,
+          "passed": true,
+          "detail": "Z mean=-1.72 range=1.524"
+        },
+        "terrain": {
+          "skipped": false,
+          "n": 1424,
+          "passed": true,
+          "detail": "Z mean=-1.78 range=1.677"
+        }
+      }
+    }
+  },
+  "check_3_distribution": {
+    "pairs": [
+      {
+        "pair": "000000-000001",
+        "l1": 0.028374258672420757,
+        "passed": true
+      },
+      {
+        "pair": "000001-000002",
+        "l1": 0.035382640229743696,
+        "passed": true
+      },
+      {
+        "pair": "000002-000003",
+        "l1": 0.036138226707715396,
+        "passed": true
+      },
+      {
+        "pair": "000003-000004",
+        "l1": 0.03783603323443541,
+        "passed": true
+      },
+      {
+        "pair": "000004-000005",
+        "l1": 0.04067257634744975,
+        "passed": true
+      },
+      {
+        "pair": "000005-000006",
+        "l1": 0.03774865013860601,
+        "passed": true
+      },
+      {
+        "pair": "000006-000007",
+        "l1": 0.03469417556889771,
+        "passed": true
+      },
+      {
+        "pair": "000007-000008",
+        "l1": 0.026398474396221613,
+        "passed": true
+      },
+      {
+        "pair": "000008-000009",
+        "l1": 0.036960671471425226,
+        "passed": true
+      }
+    ],
+    "all_pass": true
+  }
+}
