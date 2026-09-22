@@ -226,12 +226,25 @@ def collect_jobs(dataset_root, output_dir, sequences):
             scan_id = fname[:-4]
             bin_path = os.path.join(velodyne_dir, fname)
             label_path = (
-                os.path.join(labels_dir, scan_id + ".label")
-                if has_labels else None
+                find_label_path(labels_dir, scan_id) if has_labels else None
             )
             out_path = os.path.join(out_seq_dir, scan_id + ".npz")
             jobs.append((bin_path, label_path, out_path))
     return jobs
+
+
+def find_label_path(labels_dir, scan_id):
+    """
+    Look for this scan's label file under either the standard '.label'
+    extension or a '.bin' extension (some re-packaged downloads name
+    them .bin, identical to the raw binary format underneath).
+    Returns None if neither is found.
+    """
+    for ext in (".label", ".bin"):
+        candidate = os.path.join(labels_dir, scan_id + ext)
+        if os.path.exists(candidate):
+            return candidate
+    return None
 
 
 def collect_jobs_flat(input_dir, labels_dir, output_dir):
@@ -239,9 +252,11 @@ def collect_jobs_flat(input_dir, labels_dir, output_dir):
     Use this instead of collect_jobs() when your .bin files sit directly
     in one folder (no sequences/<seq>/velodyne/ nesting).
 
-    If labels_dir is given, it looks for a same-named .label file per
-    .bin file inside it (e.g. 000000.bin -> 000000.label). If labels_dir
-    is None, scans are treated as unlabeled (test-set style).
+    If labels_dir is given, it looks for a same-named label file per
+    .bin file inside it (e.g. 000000.bin -> 000000.label or 000000.bin),
+    trying both extensions. If labels_dir is None, scans are treated as
+    unlabeled (test-set style). Any poses.txt or other non-matching file
+    in labels_dir is simply ignored.
     """
     jobs = []
     if not os.path.isdir(input_dir):
@@ -256,10 +271,9 @@ def collect_jobs_flat(input_dir, labels_dir, output_dir):
             continue
         scan_id = fname[:-4]
         bin_path = os.path.join(input_dir, fname)
-        label_path = (
-            os.path.join(labels_dir, scan_id + ".label")
-            if has_labels else None
-        )
+        label_path = find_label_path(labels_dir, scan_id) if has_labels else None
+        if has_labels and label_path is None:
+            print(f"[warn] no label found for {fname} (looked for {scan_id}.label / {scan_id}.bin)")
         out_path = os.path.join(output_dir, scan_id + ".npz")
         jobs.append((bin_path, label_path, out_path))
     return jobs
