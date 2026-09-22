@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>ADAVOXEL - LiDAR Sequence Viewer</title>
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%; background: #0d1117;
+    color: #e6edf3; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    overflow: hidden;
+  }
+  #app { display: flex; flex-direction: column; height: 100%; }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 16px; background: #161b22; border-bottom: 1px solid #30363d;
+  }
+  header h1 { font-size: 15px; margin: 0; letter-spacing: 1px; color: #58a6ff; }
+  header .status { font-size: 12px; color: #8b949e; }
+
+  #main { flex: 1; display: flex; min-height: 0; }
+
+  #sidebar {
+    width: 220px; background: #161b22; border-right: 1px solid #30363d;
+    padding: 14px; box-sizing: border-box; overflow-y: auto; font-size: 13px;
+  }
+  #sidebar h2 { font-size: 11px; text-transform: uppercase; color: #8b949e;
+                margin: 16px 0 8px; letter-spacing: 0.5px; }
+  #sidebar h2:first-child { margin-top: 0; }
+  #sidebar label { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; cursor: pointer; }
+  .stat-row { display: flex; justify-content: space-between; padding: 2px 0; color: #c9d1d9; }
+  .stat-row span:last-child { color: #58a6ff; font-variant-numeric: tabular-nums; }
+  .legend-dot { width: 10px; height: 10px; border-radius: 2px; display: inline-block; margin-right: 6px; }
+
+  #viewport { flex: 1; position: relative; background: #010409; }
+  #viewport canvas { display: block; }
+  #hint { position: absolute; top: 10px; left: 12px; font-size: 11px; color: #6e7681; }
+
+  #timeline {
+    background: #161b22; border-top: 1px solid #30363d;
+    padding: 10px 16px; display: flex; align-items: center; gap: 12px;
+  }
+  #timeline button {
+    background: #21262d; border: 1px solid #30363d; color: #e6edf3;
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px;
+  }
+  #timeline button:hover { background: #30363d; }
+  #seek { flex: 1; }
+  #frameLabel { font-variant-numeric: tabular-nums; font-size: 12px; color: #8b949e; min-width: 90px; text-align: right; }
+  select { background: #21262d; color: #e6edf3; border: 1px solid #30363d; border-radius: 6px; padding: 5px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>ADAVOXEL &nbsp;·&nbsp; SEQUENCE VIEWER</h1>
+    <div class="status" id="connStatus">connecting to backend...</div>
+  </header>
+
+  <div id="main">
+    <div id="sidebar">
+      <h2>Backend</h2>
+      <div class="stat-row"><span>URL</span><span id="backendUrl">-</span></div>
+      <div class="stat-row"><span>Frames</span><span id="frameCount">-</span></div>
+
+      <h2>Frame Info</h2>
+      <div class="stat-row"><span>Points</span><span id="pointCount">-</span></div>
+      <div class="stat-row"><span>Load time</span><span id="loadTime">-</span></div>
+
+      <h2>Class Legend</h2>
+      <label><span class="legend-dot" style="background:#808080"></span>Ignore</label>
+      <label><span class="legend-dot" style="background:#33cc33"></span>Drivable</label>
+      <label><span class="legend-dot" style="background:#cccc33"></span>Non-drivable terrain</label>
+      <label><span class="legend-dot" style="background:#cc3333"></span>Static obstacle</label>
+      <label><span class="legend-dot" style="background:#3333e6"></span>Dynamic object</label>
+
+      <h2>Display</h2>
+      <label><input type="range" id="pointSize" min="1" max="6" step="0.5" value="2"> Point size</label>
+    </div>
+
+    <div id="viewport">
+      <div id="hint">Drag = rotate &nbsp;·&nbsp; Scroll = zoom &nbsp;·&nbsp; Right-drag = pan</div>
+    </div>
+  </div>
+
+  <div id="timeline">
+    <button id="playBtn">&#9654; Play</button>
+    <input type="range" id="seek" min="0" max="0" value="0" step="1">
+    <span id="frameLabel">frame 0 / 0</span>
+    <select id="speed">
+      <option value="0.5">0.5x</option>
+      <option value="1" selected>1x</option>
+      <option value="2">2x</option>
+      <option value="4">4x</option>
+    </select>
+  </div>
+</div>
+
+<script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+const BACKEND_URL = "http://localhost:8000";
+document.getElementById("backendUrl").textContent = BACKEND_URL;
+
+// ---------- Class colors (must match preprocess_semantickitti.py) ----------
+const CLASS_COLORS = {
+  0: [0.50, 0.50, 0.50],
+  1: [0.20, 0.80, 0.20],
+  2: [0.80, 0.80, 0.20],
+  3: [0.80, 0.20, 0.20],
+  4: [0.20, 0.20, 0.90],
+};
+
+// ---------- Three.js setup ----------
+const viewport = document.getElementById("viewport");
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x010409);
+
+const camera = new THREE.PerspectiveCamera(60, viewport.clientWidth / viewport.clientHeight, 0.1, 2000);
+camera.position.set(0, -30, 20);
+camera.up.set(0, 0, 1);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(viewport.clientWidth, viewport.clientHeight);
+viewport.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+const grid = new THREE.GridHelper(100, 20, 0x30363d, 0x21262d);
+grid.rotation.x = Math.PI / 2;
+scene.add(grid);
+
+let pointGeometry = new THREE.BufferGeometry();
+let pointMaterial = new THREE.PointsMaterial({ size: 2, vertexColors: true, sizeAttenuation: false });
+let pointCloud = new THREE.Points(pointGeometry, pointMaterial);
+scene.add(pointCloud);
+
+window.addEventListener("resize", () => {
+  camera.aspect = viewport.clientWidth / viewport.clientHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(viewport.clientWidth, viewport.clientHeight);
+});
+
+document.getElementById("pointSize").addEventListener("input", (e) => {
+  pointMaterial.size = parseFloat(e.target.value);
+});
+
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+animate();
+
+// ---------- Binary frame parsing ----------
+// Format: [uint32 N][N * float32 x,y,z][N * uint8 label]
+function parseFrameBuffer(buf) {
+  const view = new DataView(buf);
+  const n = view.getUint32(0, true);
+
+  const posOffset = 4;
+  const positions = new Float32Array(buf, posOffset, n * 3);
+
+  const labelOffset = posOffset + n * 3 * 4;
+  const labels = new Uint8Array(buf, labelOffset, n);
+
+  const colors = new Float32Array(n * 3);
+  for (let i = 0; i < n; i++) {
+    const c = CLASS_COLORS[labels[i]] || CLASS_COLORS[0];
+    colors[i * 3] = c[0];
+    colors[i * 3 + 1] = c[1];
+    colors[i * 3 + 2] = c[2];
+  }
+
+  return { n, positions, colors };
+}
+
+function displayFrame(parsed) {
+  pointGeometry.dispose();
+  pointGeometry = new THREE.BufferGeometry();
+  pointGeometry.setAttribute("position", new THREE.BufferAttribute(parsed.positions, 3));
+  pointGeometry.setAttribute("color", new THREE.BufferAttribute(parsed.colors, 3));
+  pointCloud.geometry = pointGeometry;
+
+  document.getElementById("pointCount").textContent = parsed.n.toLocaleString();
+}
+
+// ---------- Playback state ----------
+let frameIds = [];
+let currentIndex = 0;
+let playing = false;
+let playTimer = null;
+const frameCache = new Map(); // frameId -> ArrayBuffer
+
+async function fetchFrame(frameId) {
+  if (frameCache.has(frameId)) return frameCache.get(frameId);
+  const t0 = performance.now();
+  const res = await fetch(`${BACKEND_URL}/frames/${frameId}`);
+  if (!res.ok) throw new Error(`frame fetch failed: ${res.status}`);
+  const buf = await res.arrayBuffer();
+  document.getElementById("loadTime").textContent = `${(performance.now() - t0).toFixed(0)} ms`;
+  frameCache.set(frameId, buf);
+  return buf;
+}
+
+async function showFrameAt(index) {
+  currentIndex = Math.max(0, Math.min(frameIds.length - 1, index));
+  const frameId = frameIds[currentIndex];
+  const buf = await fetchFrame(frameId);
+  displayFrame(parseFrameBuffer(buf));
+
+  document.getElementById("seek").value = currentIndex;
+  document.getElementById("frameLabel").textContent =
+    `frame ${currentIndex + 1} / ${frameIds.length} (${frameId})`;
+
+  // prefetch the next couple frames so playback doesn't stall on network
+  for (let k = 1; k <= 2; k++) {
+    const nextId = frameIds[currentIndex + k];
+    if (nextId && !frameCache.has(nextId)) fetchFrame(nextId).catch(() => {});
+  }
+}
+
+function play() {
+  if (playing) return;
+  playing = true;
+  document.getElementById("playBtn").innerHTML = "&#10074;&#10074; Pause";
+  step();
+}
+
+function pause() {
+  playing = false;
+  document.getElementById("playBtn").innerHTML = "&#9654; Play";
+  if (playTimer) clearTimeout(playTimer);
+}
+
+async function step() {
+  if (!playing) return;
+  if (currentIndex >= frameIds.length - 1) {
+    pause();
+    return;
+  }
+  await showFrameAt(currentIndex + 1);
+  const speed = parseFloat(document.getElementById("speed").value);
+  const baseIntervalMs = 100; // ~10 fps at 1x
+  playTimer = setTimeout(step, baseIntervalMs / speed);
+}
+
+document.getElementById("playBtn").addEventListener("click", () => {
+  playing ? pause() : play();
+});
+
+document.getElementById("seek").addEventListener("input", (e) => {
+  pause();
+  showFrameAt(parseInt(e.target.value, 10));
+});
+
+// ---------- Boot ----------
+async function init() {
+  const statusEl = document.getElementById("connStatus");
+  try {
+    const res = await fetch(`${BACKEND_URL}/frames`);
+    if (!res.ok) throw new Error(`status ${res.status}`);
+    const data = await res.json();
+    frameIds = data.frames;
+
+    document.getElementById("frameCount").textContent = frameIds.length;
+    document.getElementById("seek").max = frameIds.length - 1;
+    statusEl.textContent = `connected · ${frameIds.length} frames`;
+
+    if (frameIds.length > 0) await showFrameAt(0);
+  } catch (err) {
+    statusEl.textContent = `backend unreachable (${err.message}) - is main.py running on ${BACKEND_URL}?`;
+    statusEl.style.color = "#f85149";
+  }
+}
+init();
+</script>
+</body>
+</html>
