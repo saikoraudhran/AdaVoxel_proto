@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>ADAVOXEL</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Public+Sans:wght@400;500;600;700&display=swap">
+<style>
+:root{--bg:#fff;--sf:#fafafa;--bd:#e4e4e7;--tx:#09090b;--t2:#71717a;--t3:#a1a1aa;--ac:#2563eb;--ok:#16a34a;--er:#dc2626;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media(prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#09090b;--sf:#18181b;--bd:#27272a;--tx:#fafafa;--t2:#a1a1aa;--t3:#71717a;--ac:#3b82f6}}
+:root[data-theme="dark"]{--bg:#09090b;--sf:#18181b;--bd:#27272a;--tx:#fafafa;--t2:#a1a1aa;--t3:#71717a;--ac:#3b82f6}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:13.5px/1.55 'Public Sans',system-ui,sans-serif;font-variant-numeric:tabular-nums;letter-spacing:-0.01em}
+button{font:inherit;color:inherit;cursor:pointer}
+:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+header{display:flex;justify-content:space-between;align-items:center;padding:12px 24px;border-bottom:1px solid var(--bd);background:var(--bg)}
+.logo{font-weight:700;letter-spacing:.04em;font-size:15px}.logo small{display:block;font-weight:400;letter-spacing:0;color:var(--t2);font-size:11px;margin-top:2px}
+.hr{display:flex;gap:18px;color:var(--t2);font-size:13px;align-items:center}.dot{color:var(--ok)}
+.pg{display:none}.pg.on{display:block}
+.wrap{max-width:720px;margin:0 auto;padding:52px 20px}
+h1{font-size:28px;line-height:1.15;margin:0 0 8px;letter-spacing:-.02em}.sub{color:var(--t2);margin:0 0 32px;font-size:14px}
+.drop{border:1.5px dashed var(--t3);border-radius:12px;background:var(--sf);padding:40px 20px;text-align:center;transition:all .2s ease}
+.drop.hv{border-color:var(--ac);background:color-mix(in srgb,var(--ac) 6%,var(--sf))}
+.drop b{display:block;font-size:15px;margin:6px 0}.drop span{color:var(--t2);font-size:13px}
+.link{background:none;border:0;color:var(--ac);padding:0;text-decoration:underline;font-weight:500}
+.btn{background:var(--ac);color:#fff;border:0;border-radius:8px;padding:9px 18px;font-weight:600;font-size:13.5px;transition:opacity .15s}
+.btn:hover{opacity:0.9}
+.btn:disabled{opacity:.4;cursor:not-allowed}.btn.g{background:var(--sf);color:var(--tx);border:1px solid var(--bd);box-shadow:0 1px 2px rgba(0,0,0,0.02)}
+.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.val{margin-top:16px;padding:12px 16px;border:1px solid var(--bd);border-radius:10px;font-size:13px;background:var(--sf)}
+.val.ok{border-color:var(--ok)}.val.bad{border-color:var(--er);color:var(--er)}
+.feat{display:grid;grid-template-columns:repeat(3,1fr);gap:24px;margin-top:40px;border-top:1px solid var(--bd);padding-top:24px}
+.feat b{display:block;font-size:13.5px;margin-bottom:2px}.feat span{color:var(--t2);font-size:12.5px;line-height:1.4}
+.badge{font-size:11.5px;color:var(--tx);border:1px solid var(--bd);border-radius:99px;padding:3px 10px;background:var(--sf);font-weight:500}.badge i{color:var(--ac);font-style:normal;margin-right:4px}
+.stage{display:flex;gap:6px;margin:24px 0}.stage div{flex:1;font-size:11.5px;color:var(--t3);border-top:2.5px solid var(--bd);padding-top:6px;font-weight:500}
+.stage div.d{color:var(--tx);border-color:var(--ok)}.stage div.a{color:var(--tx);border-color:var(--ac)}
+.pb{margin:12px 0}.pb>div{display:flex;justify-content:space-between;font-size:12.5px;margin-bottom:6px;font-weight:500}
+.bar{height:6px;background:var(--bd);border-radius:3px;overflow:hidden}.bar i{display:block;height:100%;background:var(--ac);width:0;transition:width .1s ease}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-top:24px}
+.stats div{background:var(--sf);border:1px solid var(--bd);border-radius:10px;padding:12px}.stats small{display:block;color:var(--t2);font-size:11px;margin-bottom:4px;font-weight:500;text-transform:uppercase;letter-spacing:0.02em}.stats b{font-size:18px;font-weight:600;letter-spacing:-0.01em}
+/* ── viewer layout ── */
+.app{display:grid;grid-template-columns:220px 1fr 260px;height:calc(100vh - 53px - env(safe-area-inset-top,0px));min-height:560px}
+.side{padding:16px;overflow:auto;background:var(--bg)}.side.l{border-right:1px solid var(--bd)}.side.r{border-left:1px solid var(--bd)}
+h3{font-size:11px;margin:20px 0 8px;color:var(--t2);font-weight:600;text-transform:uppercase;letter-spacing:0.04em}h3:first-child{margin-top:0}
+.big{font-size:20px;font-weight:600;letter-spacing:-0.01em}
+input[type=range]{width:100%;accent-color:var(--ac);margin:8px 0}
+.seg{display:flex;border:1px solid var(--bd);border-radius:8px;overflow:hidden;margin-bottom:8px;background:var(--sf);padding:2px}
+.seg button{flex:1;border:0;background:transparent;padding:6px 4px;font-size:12px;color:var(--t2);border-radius:6px;font-weight:500}
+.seg button.on{background:var(--bg);color:var(--tx);box-shadow:0 1px 3px rgba(0,0,0,0.05)}
+select{width:100%;padding:6px 8px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--tx);font-size:13px;font-family:inherit}
+.ctl{display:flex;gap:6px;margin:8px 0}.ctl button{flex:1;padding:6px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);font-size:13px;font-weight:500;box-shadow:0 1px 2px rgba(0,0,0,0.02)}
+.lg{display:flex;align-items:center;gap:8px;font-size:13px;padding:4px 0;color:var(--tx)}.lg s{width:10px;height:10px;border-radius:3px;flex-shrink:0}.lg em{margin-left:auto;font-style:normal;color:var(--t2);font-size:12px;font-variant-numeric:tabular-nums}
+.lab{display:flex;align-items:center;gap:8px;font-size:13px;padding:3px 0;cursor:pointer}
+.kv{display:flex;justify-content:space-between;align-items:baseline;padding:4px 0;font-size:13px;gap:8px}.kv span{color:var(--t2);flex-shrink:0}.kv b{text-align:right;font-weight:500}
+.dist{margin:8px 0}.dist>div{display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;color:var(--t2)}.dist .bar{height:5px;border-radius:2.5px;background:var(--bd)}
+/* ── canvas viewport ── */
+.vw{position:relative;background:#09090b;min-width:0;overflow:hidden}
+canvas{width:100%;height:100%;display:block;cursor:grab;touch-action:none}
+canvas:active{cursor:grabbing}
+.ov{position:absolute;color:#a1a1aa;font-size:12px;pointer-events:none}
+.tl{top:16px;left:16px;background:rgba(9,9,11,0.7);padding:6px 12px;border-radius:8px;backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,0.08);font-weight:500;color:#fafafa}
+.bl{bottom:16px;left:16px;background:rgba(9,9,11,0.7);padding:4px 10px;border-radius:6px;backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,0.05);font-size:11.5px}
+.zm{top:16px;right:16px;display:flex;flex-direction:column;gap:6px;pointer-events:auto}
+.zm button{width:32px;height:32px;border-radius:8px;border:1px solid rgba(255,255,255,0.1);background:rgba(9,9,11,0.7);color:#fafafa;font-size:16px;backdrop-filter:blur(8px);transition:background .15s}
+.zm button:hover{background:rgba(255,255,255,0.1)}
+/* ── point inspector ── */
+.insp{bottom:16px;right:16px;background:rgba(9,9,11,0.85);border:1px solid rgba(255,255,255,0.1);padding:0;border-radius:12px;min-width:190px;display:none;backdrop-filter:blur(12px);box-shadow:0 12px 40px rgba(0,0,0,0.5);pointer-events:none;overflow:hidden}
+.insp-head{display:flex;align-items:center;gap:8px;padding:10px 14px 8px;border-bottom:1px solid rgba(255,255,255,0.08);background:rgba(255,255,255,0.03)}
+.insp-head s{width:10px;height:10px;border-radius:3px;flex-shrink:0}
+.insp-head b{color:#fafafa;font-size:12.5px;font-weight:600}
+.insp-body{padding:10px 14px 12px}
+.insp div{display:flex;justify-content:space-between;gap:16px;padding:3px 0;font-size:12px}
+.insp span{color:#a1a1aa}.insp b{color:#fafafa;font-weight:500;font-variant-numeric:tabular-nums}
+@media(max-width:900px){.app{grid-template-columns:1fr;height:auto}.vw{height:60vh;order:-1}.side.l,.side.r{border:0}.feat,.stats{grid-template-columns:1fr 1fr}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style></head><body>
+<header><div class="logo">ADAVOXEL<small>Adaptive Variable Resolution 2.5D LiDAR Mapping</small></div>
+<div class="hr"><span>Documentation</span><span><span class="dot">●</span> API</span></div></header>
+
+<main id="up" class="pg on"><div class="wrap">
+<h1>LiDAR sequence analysis</h1><p class="sub">Adaptive voxelization and semantic 2.5D mapping. Upload a sequence to inspect it frame by frame.</p>
+<div class="drop" id="drop"><div id="dz"><b>Upload LiDAR sequence</b><span>Drag and drop a ZIP file here or <button class="link" id="br">browse files</button><br>.bin + .label sequence</span></div></div>
+<input type="file" id="fi" accept=".zip" hidden>
+<div id="val"></div>
+<div class="row" style="margin-top:20px"><button class="btn" id="go" disabled>Process sequence</button><button class="btn g" id="demo">Example 1 (Synthetic)</button><button class="btn g" id="demo2">Example 2 (SemanticKITTI seq-04)</button></div>
+<div class="feat"><div><b>Adaptive resolution</b><span>5 cm, 15 cm and 50 cm voxels by distance</span></div><div><b>2.5D mapping</b><span>Height kept per top-down cell</span></div><div><b>5-class semantics</b><span>Terrain and objects</span></div></div>
+</div></main>
+
+<main id="pr" class="pg"><div class="wrap">
+<div class="row" style="justify-content:space-between"><h1 style="font-size:24px">Processing sequence</h1><span class="badge"><i>●</i> <span id="dmlbl">Demo inference</span></span></div>
+<p class="sub" id="pfn"></p>
+<div class="stage" id="stg"></div>
+<div class="pb"><div><span>Adaptive voxelization</span><span id="p1t">0%</span></div><div class="bar"><i id="p1"></i></div></div>
+<div class="pb"><div><span>2.5D projection</span><span id="p2t">0%</span></div><div class="bar"><i id="p2"></i></div></div>
+<div class="pb"><div><span>Semantic mapping</span><span id="p3t">0%</span></div><div class="bar"><i id="p3"></i></div></div>
+<div class="stats"><div><small>Current frame</small><b id="sf">0</b></div><div><small>Points</small><b id="sp">0</b></div><div><small>Occupied voxels</small><b id="sv">0</b></div><div><small>Processing time</small><b id="st">0 ms</b></div></div>
+</div></main>
+
+<main id="vw" class="pg"><div class="app">
+<aside class="side l">
+<h3>Frame</h3><div class="big" id="fl">000000 / 0</div><input type="range" id="sl" min="0" value="0" aria-label="Frame">
+<div class="ctl"><button id="pv" aria-label="Previous">◀</button><button id="pl">▶ Play</button><button id="nx" aria-label="Next">▶</button></div>
+<select id="sp2" aria-label="Speed"><option value="4">0.25×</option><option value="2">0.5×</option><option value="1" selected>1×</option><option value="0.5">2×</option><option value="0.25">4×</option></select>
+<h3>Visualization</h3><div class="seg" id="mode"><button data-v="pred" class="on">Prediction</button><button data-v="gt">Ground truth</button></div><div class="seg" id="mode2"><button data-v="height">Height</button></div>
+<h3>Resolution</h3><div id="res"></div>
+<label class="lab" style="margin-top:8px"><input type="checkbox" id="bnd"> Show resolution boundaries</label>
+<h3>Semantic classes</h3><div id="lg"></div>
+</aside>
+<div class="vw"><canvas id="cv"></canvas>
+<div class="ov tl" id="lvl">Composite</div><div class="ov bl" id="fr"></div>
+<div class="ov zm"><button id="zi" aria-label="Zoom in">+</button><button id="zo" aria-label="Zoom out">−</button><button id="zr" aria-label="Reset view">⌾</button></div>
+<div class="ov insp" id="insp"></div></div>
+<aside class="side r">
+<h3>Frame statistics</h3><div id="fs"></div>
+<h3>Adaptive resolution</h3><div id="rs"></div>
+<h3>Semantic distribution</h3><div id="ds"></div>
+<h3>Mode</h3><span class="badge"><i>●</i> <span id="vwlbl">Demo inference</span></span>
+</aside></div></main>
+
+<<script>
+const $=id=>document.getElementById(id);
+const CLS=[['ignore','Ignore','#64748B'],['drivable','Drivable','#34D399'],['non_drivable','Non-drivable Terrain','#F59E0B'],['static_obstacle','Static Obstacle','#A78BFA'],['dynamic_object','Dynamic Object','#F43F5E']];
+const LV=[{n:'L0',r:.05,a:0,b:10},{n:'L1',r:.15,a:10,b:30},{n:'L2',r:.5,a:30,b:100}];
+const lvOf=d=>d<10?0:d<30?1:2;
+function rnd(n){let x=Math.sin(n*127.1+311.7)*43758.5453;return x-Math.floor(x)}
+
+// ── Example 1: synthetic scene generator ──────────────────
+const cache1=new Map();
+function rayBox(o,d,b){let t0=0,t1=1e9;for(const[i,lo,hi]of[[0,b[0],b[1]],[1,b[2],b[3]]]){const p=i?d.y:d.x,q=i?o.y:o.x;if(Math.abs(p)<1e-9){if(q<lo||q>hi)return-1}else{let a=(lo-q)/p,c=(hi-q)/p;if(a>c)[a,c]=[c,a];t0=Math.max(t0,a);t1=Math.min(t1,c);if(t0>t1)return-1}}return t0>0?t0:-1}
+function syntheticFrame(f){
+ if(cache1.has(f))return cache1.get(f);
+ const x0=f*.6,boxes=[];
+ for(let k=Math.floor(x0/20)-1;k<Math.floor(x0/20)+7;k++){if(k%4===3)continue;const a=k*20-x0;boxes.push([a,a+18,7.5,10,3,2]);boxes.push([a,a+18,-10,-7.5,3,2])}
+ for(let k=0;k<3;k++){const wx=40+k*35+(f*(k+1)*.15)-x0+(k===2?-f*.4:0),y=k===1?-2:2.2+k*.3*(k%2?-1:1);boxes.push([wx,wx+4.2,y-.9,y+.9,1.5,4])}
+ for(let k=Math.floor(x0/9);k<Math.floor(x0/9)+14;k++){if(rnd(k)<.55)continue;const a=k*9-x0;boxes.push([a,a+4,5.2,6.6,1.5,3])}
+ const P=[],o={x:0,y:0};
+ for(let i=0;i<900;i++){
+  const th=i/900*Math.PI*2,d={x:Math.cos(th),y:Math.sin(th)};let hit=100,hb=null;
+  for(const b of boxes){if(b[1]<-5||b[0]>100)continue;const t=rayBox(o,d,b);if(t>0&&t<hit){hit=t;hb=b}}
+  for(let g=2,c=0;g<Math.min(hit,90);g*=1.06+c*.0004,c++){
+   const x=d.x*g,y=d.y*g,r=rnd(f*7919+i*31+c);if(r<.12)continue;
+   const ay=Math.abs(y);P.push([x,y,-1.7,ay<5.2?1:ay<7.5?2:0,ay<5.2?1:ay<7.5?2:0])}
+  if(hb)for(let h=0;h<6;h++){const z=-1.7+h*(hb[4]+1.7)/5;if(rnd(f*13+i*7+h)<.5)P.push([d.x*hit,d.y*hit,z,hb[5],hb[5]])}
+ }
+ const pts=P.map((p,j)=>{const d=Math.hypot(p[0],p[1]);let gt=p[3],pr=p[4];const r=rnd(f*3+j);
+  if(d>70||r<.02)gt=0;if(r>.965){pr=pr===1?2:pr===2?1:0}else if(d>70)pr=0;
+  return{x:p[0],y:p[1],z:p[2],gt,pr,l:lvOf(d),c:.6+.39*rnd(j*5+f),n:1+Math.floor(rnd(j)*18)}});
+ const vox=[new Set,new Set,new Set];pts.forEach(p=>vox[p.l].add(Math.floor(p.x/LV[p.l].r)+','+Math.floor(p.y/LV[p.l].r)));
+ const out={id:String(f).padStart(6,'0'),pts,lv:vox.map(s=>s.size*40),points:pts.length*20,voxels:vox.reduce((a,s)=>a+s.size*40,0),ms:70+Math.floor(rnd(f)*30)};
+ cache1.set(f,out);if(cache1.size>60)cache1.delete(cache1.keys().next().value);return out}
+
+// ── Example 2: real SemanticKITTI seq-04 data ─────────────
+let demo2Frames=null;
+let demo2Loading=false;
+let demo2Ready=false;
+function loadDemo2(cb){
+ if(demo2Ready){cb();return}
+ if(demo2Loading){const poll=setInterval(()=>{if(demo2Ready){clearInterval(poll);cb()}},200);return}
+ demo2Loading=true;
+ $('demo2').textContent='Loading…';$('demo2').disabled=true;
+ fetch('demo2_data.json').then(r=>r.json()).then(d=>{
+  demo2Frames=d;demo2Ready=true;
+  $('demo2').textContent='Example 2 (SemanticKITTI seq-04)';$('demo2').disabled=false;
+  cb();
+ }).catch(e=>{
+  alert('Could not load demo2_data.json – make sure it is in the same folder as index.html.\n'+e);
+  $('demo2').textContent='Example 2 (SemanticKITTI seq-04)';$('demo2').disabled=false;
+  demo2Loading=false;
+ })}
+function ex2Frame(i){
+ if(!demo2Ready||!demo2Frames)return null;
+ const d=demo2Frames[Math.min(i,demo2Frames.length-1)];
+ return{id:d.id,pts:d.pts,lv:d.lv,points:d.points,voxels:d.voxels,ms:d.ms,lv_counts:d.lv_counts}}
+
+// ── Active mode ────────────────────────────────────────────
+let activeMode='ex1';
+const TOTAL_EX1=240;
+function totalFrames(){return activeMode==='ex1'?TOTAL_EX1:(demo2Frames?demo2Frames.length:11)}
+function getFrame(f){return activeMode==='ex1'?syntheticFrame(f):ex2Frame(f)}
+
+// ── State ──────────────────────────────────────────────────
+const S={f:0,play:false,speed:1,mode:'pred',lvl:-1,bnd:false,z:1,px:0,py:0,sel:null};
+
+// ── Pages ──────────────────────────────────────────────────
+function show(id){document.querySelectorAll('.pg').forEach(e=>e.classList.toggle('on',e.id===id))}
+let file=null;const fmt=n=>n.toLocaleString('en-US');
+function setFile(f){
+ const v=$('val');if(!f)return;
+ if(!/\.zip$/i.test(f.name)){v.className='val bad';v.textContent='Only .zip files are supported. Choose a ZIP that contains velodyne/*.bin and labels/*.label.';$('go').disabled=true;return}
+ file=f;$('dz').innerHTML='<b>✓ '+f.name+'</b><span>Size: '+(f.size/1e6).toFixed(1)+' MB<br><button class="link" id="ch">Change file</button></span>';
+ $('ch').onclick=()=>$('fi').click();
+ v.className='val ok';v.innerHTML='<b>Sequence validated</b><br>'+fmt(TOTAL_EX1)+' LiDAR frames · '+fmt(TOTAL_EX1)+' label files · Labels available<br><span style="color:var(--t2)">Demo backend: Example 1 (synthetic) is used for every upload.</span>';$('go').disabled=false}
+$('br').onclick=()=>$('fi').click();$('fi').onchange=e=>setFile(e.target.files[0]);
+const dp=$('drop');['dragover','dragenter'].forEach(n=>dp.addEventListener(n,e=>{e.preventDefault();dp.classList.add('hv')}));
+['dragleave','drop'].forEach(n=>dp.addEventListener(n,e=>{e.preventDefault();dp.classList.remove('hv')}));
+dp.addEventListener('drop',e=>setFile(e.dataTransfer.files[0]));
+
+const ST=['Upload','Validate','Extract','Voxelize','Project','Semantic','Render'];
+function process(mode){
+ activeMode=mode||'ex1';
+ const lbl=activeMode==='ex2'?'Example 2 · SemanticKITTI seq-04':'Example 1 · Synthetic';
+ $('dmlbl').textContent=lbl;$('vwlbl').textContent=lbl;
+ show('pr');
+ $('pfn').textContent=activeMode==='ex2'?'SemanticKITTI sequence-04  ·  11 frames  ·  adaptive voxelization + 5-class remapping':file.name;
+ let t=0;
+ const total=totalFrames();
+ const iv=setInterval(()=>{t+=.012;const p=[Math.min(1,t*1.6),Math.min(1,Math.max(0,t*1.4-.15)),Math.min(1,Math.max(0,t*1.3-.3))];
+  [1,2,3].forEach(i=>{$('p'+i).style.width=p[i-1]*100+'%';$('p'+i+'t').textContent=Math.round(p[i-1]*100)+'%'});
+  const fr=Math.min(total,Math.floor(t*total)),d=getFrame(Math.min(fr,total-1));
+  $('sf').textContent=fr+' / '+total;$('sp').textContent=fmt(d.points);$('sv').textContent=fmt(d.voxels);$('st').textContent=d.ms+' ms';
+  const idx=Math.min(6,Math.floor(2+t*5));$('stg').innerHTML=ST.map((s,i)=>'<div class="'+(i<idx?'d':i===idx?'a':'')+'">'+( i<idx?'✓ ':'')+s+'</div>').join('');
+  if(t>=1){clearInterval(iv);openViewer()}},40)}
+
+$('demo').onclick=()=>{activeMode='ex1';file={name:'sequence_00 (Example 1 – synthetic)'};process('ex1')};
+$('demo2').onclick=()=>{loadDemo2(()=>process('ex2'))};
+$('go').onclick=()=>process('ex1');
+
+// ── Viewer ─────────────────────────────────────────────────
+const cv=$('cv'),cx=cv.getContext('2d');let W=0,H=0,dpr=1;
+function resize(){const r=cv.parentElement.getBoundingClientRect();dpr=devicePixelRatio||1;W=r.width;H=r.height;cv.width=W*dpr;cv.height=H*dpr;draw()}
+addEventListener('resize',resize);
+function ui(){
+ $('lg').innerHTML=CLS.map(c=>'<div class="lg"><s style="background:'+c[2]+'"></s>'+c[1]+'<em id="c_'+c[0]+'"></em></div>').join('');
+ $('res').innerHTML=[['Composite',-1,''],...LV.map((l,i)=>[l.n,i,' '+l.r*100+' cm'])].map(r=>'<label class="lab"><input type="radio" name="rl" value="'+r[1]+'"'+(r[1]==-1?' checked':'')+'>'+r[0]+r[2]+'</label>').join('');
+ document.querySelectorAll('[name=rl]').forEach(e=>e.onchange=()=>{S.lvl=+e.value;$('lvl').textContent=S.lvl<0?'Composite · L0 + L1 + L2':LV[S.lvl].n+' · '+LV[S.lvl].r*100+' cm';draw()});
+}
+function openViewer(){
+ show('vw');
+ const total=totalFrames();
+ $('sl').max=total-1;
+ if(!$('lg').innerHTML)ui();
+ S.z=1;S.px=0;S.py=0;S.sel=null;$('insp').style.display='none';
+ resize();setF(0)}
+function setF(f){
+ const total=totalFrames();
+ S.f=Math.max(0,Math.min(total-1,f));$('sl').value=S.f;
+ const d=getFrame(S.f);if(!d)return;
+ $('fl').textContent=d.id+' / '+total;$('fr').textContent='Frame '+d.id;
+ const key=S.mode==='gt'?'gt':'pr',cnt=[0,0,0,0,0];
+ d.pts.forEach(p=>cnt[p[key]]++);
+ const sc=d.points/Math.max(1,d.pts.length);
+ CLS.forEach((c,i)=>$('c_'+c[0]).textContent=fmt(Math.round(cnt[i]*sc)));
+ $('fs').innerHTML=[['Frame',d.id],['Points',fmt(d.points)],['Occupied voxels',fmt(d.voxels)],['Processing',d.ms+' ms']].map(r=>'<div class="kv"><span>'+r[0]+'</span><b>'+r[1]+'</b></div>').join('');
+ const lvSfx=activeMode==='ex2'?' pts':'';
+ $('rs').innerHTML=LV.map((l,i)=>'<div class="kv"><span>'+l.n+' · '+l.a+'–'+l.b+' m · '+l.r*100+' cm</span><b>'+fmt(d.lv[i])+lvSfx+'</b></div>').join('');
+ $('ds').innerHTML=CLS.slice(1).map((c,i)=>{const p=cnt[i+1]/Math.max(1,d.pts.length)*100;return'<div class="dist"><div><span>'+c[1]+'</span><span>'+p.toFixed(1)+'%</span></div><div class="bar"><i style="width:'+p+'%;background:'+c[2]+'"></i></div></div>'}).join('');
+ draw()}
+function hue(z){const t=Math.max(0,Math.min(1,(z+2.5)/6));return'hsl('+(240-t*240)+',85%,65%)'}
+const scl=()=>Math.min(W,H)/110*S.z;
+const tx=(x,y)=>[W/2+S.px-y*scl(),H/2+S.py-x*scl()];
+function draw(){
+ if(!W)return;cx.setTransform(dpr,0,0,dpr,0,0);cx.clearRect(0,0,W,H);
+ const d=getFrame(S.f);if(!d)return;
+ const k=scl();
+ if(S.bnd){cx.strokeStyle='rgba(255,255,255,0.1)';cx.fillStyle='rgba(255,255,255,0.4)';cx.setLineDash([4,6]);cx.font='11px Public Sans';[10,30].forEach(r=>{const[a,b]=tx(0,0);cx.beginPath();cx.arc(a,b,r*k,0,7);cx.stroke();cx.fillText(r+' m',a+4,b-r*k-4)});cx.setLineDash([])}
+ const key=S.mode==='gt'?'gt':'pr',ps=Math.max(1.5,Math.min(k*.35,4));
+ cx.globalAlpha=0.9;
+ for(const p of d.pts){if(S.lvl>=0&&p.l!==S.lvl)continue;const[a,b]=tx(p.x,p.y);if(a<-5||b<-5||a>W+5||b>H+5)continue;
+  cx.fillStyle=S.mode==='height'?hue(p.z):CLS[p[key]][2];cx.fillRect(a-ps/2,b-ps/2,ps,ps)}
+ cx.globalAlpha=1.0;
+ const[a,b]=tx(0,0);cx.strokeStyle='rgba(255,255,255,0.6)';cx.lineWidth=1.5;cx.beginPath();
+ cx.moveTo(a-6,b);cx.lineTo(a+6,b);cx.moveTo(a,b-6);cx.lineTo(a,b+6);cx.stroke();cx.lineWidth=1;
+ if(S.sel){const[sa,sb]=tx(S.sel.x,S.sel.y);cx.strokeStyle='#38bdf8';cx.strokeRect(sa-5,sb-5,10,10)}}
+// controls
+$('sl').oninput=e=>setF(+e.target.value);$('pv').onclick=()=>setF(S.f-1);$('nx').onclick=()=>setF(S.f+1);
+let timer=null;function tick(){clearInterval(timer);if(S.play)timer=setInterval(()=>setF(S.f>=totalFrames()-1?0:S.f+1),100*S.speed)}
+$('pl').onclick=()=>{S.play=!S.play;$('pl').textContent=S.play?'❚❚ Pause':'▶ Play';tick()};
+$('sp2').onchange=e=>{S.speed=+e.target.value;tick()};
+function seg(){document.querySelectorAll('#mode button,#mode2 button').forEach(b=>b.onclick=()=>{S.mode=b.dataset.v;document.querySelectorAll('#mode button,#mode2 button').forEach(x=>x.classList.toggle('on',x===b));setF(S.f)})}seg();
+$('bnd').onchange=e=>{S.bnd=e.target.checked;draw()};
+const zoom=m=>{S.z=Math.max(.4,Math.min(30,S.z*m));draw()};
+$('zi').onclick=()=>zoom(1.3);$('zo').onclick=()=>zoom(1/1.3);$('zr').onclick=()=>{S.z=1;S.px=S.py=0;draw()};
+cv.addEventListener('wheel',e=>{e.preventDefault();zoom(e.deltaY<0?1.12:1/1.12)},{passive:false});
+let dr=null,moved=0;cv.onpointerdown=e=>{dr=[e.clientX,e.clientY];moved=0;cv.setPointerCapture(e.pointerId)};
+cv.onpointermove=e=>{if(!dr)return;const dx=e.clientX-dr[0],dy=e.clientY-dr[1];moved+=Math.abs(dx)+Math.abs(dy);S.px+=dx;S.py+=dy;dr=[e.clientX,e.clientY];draw()};
+cv.onpointerup=e=>{dr=null;if(moved>4)return;const r=cv.getBoundingClientRect(),mx=e.clientX-r.left,my=e.clientY-r.top;let best=null,bd=14;
+ const d=getFrame(S.f);if(!d)return;
+ for(const p of d.pts){if(S.lvl>=0&&p.l!==S.lvl)continue;const[a,b]=tx(p.x,p.y),q=Math.hypot(a-mx,b-my);if(q<bd){bd=q;best=p}}
+ S.sel=best;const ins=$('insp');if(!best){ins.style.display='none';draw();return}
+ const key=S.mode==='gt'?'gt':'pr';ins.style.display='block';
+ ins.innerHTML='<div class="insp-head"><s style="background:'+CLS[best[key]][2]+'"></s><b>'+CLS[best[key]][1]+'</b></div><div class="insp-body"><div><span>Level</span><b>'+LV[best.l].n+'</b></div><div><span>Resolution</span><b>'+LV[best.l].r*100+' cm</b></div><div><span>Confidence</span><b>'+(best.c*100).toFixed(0)+'%</b></div><div><span>Height</span><b>'+(best.z+1.7).toFixed(2)+' m</b></div><div><span>Points</span><b>'+best.n+'</b></div></div>';draw()};
+</script></body></html>
